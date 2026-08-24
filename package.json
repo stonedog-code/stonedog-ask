@@ -5,7 +5,8 @@
   "description": "Hand work to a second model from the shell: ask-gemini, ask-copilot.",
   "type": "module",
   "bin": {
-    "ask-gemini": "bin/ask-gemini"
+    "ask-gemini": "bin/ask-gemini",
+    "ask-copilot": "bin/ask-copilot"
   },
   "engines": {
     "node": ">=20"

@@ -6,6 +6,7 @@ one command per vendor, sharing one credential resolver and one usage ledger.
 | command | wraps | used for |
 |---|---|---|
 | `ask-gemini` | `@google/gemini-cli` | whole-repo digests, PRD/plan/diff review |
+| `ask-copilot` | `@github/copilot` | the twice-daily brief/wrap cron, one-off questions |
 
 These are **wrappers around vendor CLIs**, not API clients. They call the CLI
 you are already entitled to, so a subscription is used rather than a per-token
@@ -14,8 +15,9 @@ key wherever the vendor allows it.
 ## Install
 
 ```bash
-npm link            # or: ln -s "$PWD/bin/ask-gemini" ~/.local/bin/ask-gemini
-ask-gemini --check  # verifies credentials with a real call
+npm link             # puts ask-gemini and ask-copilot on PATH
+ask-gemini --check   # verifies credentials with a real call
+ask-copilot --check  # same, plus Copilot entitlement and MCP sources
 ```
 
 ## ask-gemini
@@ -72,3 +74,105 @@ and every cron job. With no key at all the CLI falls back to OAuth, which is the
 correct path for an account whose entitlement is intact.
 
 **Never fix a credential failure by putting a key back in a dotfile.**
+
+## ask-copilot
+
+Built for two cron runs rather than for interactive use.
+
+```bash
+ask-copilot --brief     # start of day: what is due, what needs me
+ask-copilot --wrap      # end of day:   what moved, what slipped
+ask-copilot "question"  # one-off
+ask-copilot --check     # credentials AND entitlement, one real call
+ask-copilot --sources   # which MCP sources are configured
+ask-copilot --cron      # print crontab lines for the pair
+```
+
+### Why Copilot for this and not Gemini
+
+Copilot CLI is **agentic**. With MCP servers configured it goes and reads mail,
+a SharePoint site or an issue tracker *itself*, rather than being handed a blob
+something else had to assemble. For a "what does today need" job that is the
+whole difference — the alternative is writing and maintaining a connector per
+source before any summarising can start.
+
+It is also the reason for the conservative defaults. An agent with tools,
+running unattended at 06:45 against a work account, reading mail that other
+people wrote, is a different risk from one you are watching. Prompt content is
+untrusted input here. `--allow-all-tools` includes shell execution and is off
+unless you ask for it.
+
+### The journal is the point
+
+The two runs are the same job seen from both ends, and each appends a dated
+Markdown entry to `~/.stonedog-ask/journal/`. Each run is then given the recent
+entries back as context.
+
+That loop is what the pair exists for. Nothing in an inbox says *"you have been
+ignoring me for four days"* — that fact lives only in the gap between two
+summaries, so something has to hold it. Both prompts end with an `## OPEN ITEMS`
+block carrying each item's original **first seen** date, and both are told to
+carry every still-open item forward with that date intact. Deadlines survive
+because they are restated every day until they close, not because a parser
+understood them.
+
+Plain Markdown, one file per day, mode 0600 in a 0700 directory — it has to be
+readable and fixable by hand at 7am when a cron job has written something wrong.
+
+### Sources
+
+`ask-copilot` does **not** create MCP servers. A mail or SharePoint connector is
+an authenticated integration with a consent flow behind it, and a wrapper that
+silently wrote one into place would be claiming an authorisation nobody granted.
+Configure them with `copilot mcp add` (they land in `~/.copilot/mcp-config.json`).
+
+What this tool does instead is refuse to run without one you named:
+
+```bash
+ask-copilot --brief --source mail --source sharepoint
+```
+
+A brief with a silently missing source looks exactly like a quiet day. That is
+the single most likely way this job lies to you, so it fails loudly instead.
+
+### Credentials
+
+Resolved in the same order as `ask-gemini`, through the same shared module:
+
+1. the environment — `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`
+2. the workstation secret (`WS_SECRET_ID`, default `workstation/nehsa`)
+3. `gh auth token`
+4. a login-shell probe
+
+All three variables are then **stripped** and only the winner is set. They are a
+precedence chain, so a stale value in an earlier one silently beats a good value
+in a later one — the symptom is "Copilot says I am not entitled" and the cause
+is a variable some other tool exported.
+
+For unattended use the token must be a **fine-grained PAT with the "Copilot
+Requests" permission**, on an account with a Copilot seat. A token that
+authenticates is not a token with Copilot access, which is exactly what
+`--check`'s live probe is for.
+
+### Config
+
+`~/.stonedog-ask/copilot.json` — see `copilot.example.json`. The important key is
+`copilotArgs`, which replaces the base arguments wholesale.
+
+> **Verify the flag names at install time.** This was written against Copilot
+> CLI's documented flags on a machine where the binary is not installed. `-p`,
+> `-s`, `--no-ask-user` and `--allow-all-tools` are documented; the per-tool
+> grant flag is not verified. Run `copilot --help` on the target machine and put
+> corrections in `copilotArgs` rather than patching the script.
+
+### Setting up the cron
+
+```bash
+ask-copilot --check          # credentials, entitlement, sources
+ask-copilot --sources        # confirm mail/sharepoint are actually there
+ask-copilot --brief --dry-run  # read the assembled prompt before it runs alone
+ask-copilot --cron >> /tmp/lines && crontab -e
+```
+
+Cron gets almost no environment, which is precisely why the credential resolver
+reads the workstation secret directly: a cron job never ran `load-secrets`.
