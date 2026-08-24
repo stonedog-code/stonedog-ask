@@ -176,3 +176,4 @@ ask-copilot --cron >> /tmp/lines && crontab -e
 
 Cron gets almost no environment, which is precisely why the credential resolver
 reads the workstation secret directly: a cron job never ran `load-secrets`.
+
