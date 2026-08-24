@@ -81,7 +81,8 @@ Modes (at most one):
   --wrap                end-of-day wrap, appended to the journal
   --check               verify credentials, entitlement and sources; makes one
                         small real call
-  --cron                print suggested crontab lines and exit
+  --cron [PLATFORM]     print a ready-to-use schedule and exit. PLATFORM is
+                        linux | systemd | macos; defaults to this machine
   --sources             list configured MCP sources and exit
 
 Options:
@@ -122,7 +123,11 @@ function parseArgs(argv) {
       case "--brief": setMode("brief"); break;
       case "--wrap": setMode("wrap"); break;
       case "--check": setMode("check"); break;
-      case "--cron": setMode("cron"); break;
+      case "--cron":
+        setMode("cron");
+        // Optional argument: only consume the next token if it is not a flag.
+        if (argv[i + 1] && !argv[i + 1].startsWith("-")) opts.platform = argv[++i];
+        break;
       case "--sources": setMode("sources"); break;
       case "--source": opts.sources.push(argv[++i]); break;
       case "--days": opts.days = Number(argv[++i]); break;
@@ -392,22 +397,144 @@ const config = loadConfig();
 
 if (opts.mode === "cron") {
   const self = process.argv[1];
-  process.stdout.write(`# stonedog-ask — two runs a day. Adjust the times and the PATH.
-# Cron gets almost no environment, so give it an explicit PATH and let
-# ask-copilot resolve its own credentials (that is what the Secrets Manager
-# source is for — a cron job never ran \`load-secrets\`).
+  const log = join(JOURNAL_DIR, "cron.log");
+  const platform = opts.platform ?? (process.platform === "darwin" ? "macos" : "linux");
 
-PATH=${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}
+  /**
+   * The interpreter, resolved absolutely.
+   *
+   * This is the failure that eats an evening. The shebang is `#!/usr/bin/env
+   * node`, and a scheduler's PATH is not your shell's PATH — under nvm, `node`
+   * lives in a versioned directory that only a shell profile ever adds, and
+   * neither cron nor launchd sources a profile. The job then dies with
+   * `env: node: No such file or directory` into a log nobody is watching, which
+   * is indistinguishable from a quiet day.
+   *
+   * So emit the absolute path of the interpreter running right now rather than
+   * hoping the scheduler finds one. If a system node also exists it may well be
+   * a DIFFERENT VERSION from the one your shell picks — true on the machine
+   * this was written on — which is its own reason not to leave it to chance.
+   */
+  const nodeDir = process.execPath.replace(/\/[^/]+$/, "");
+  const cronPath = `${nodeDir}:/usr/local/bin:/usr/bin:/bin`;
 
-45 6 * * 1-5  ${self} --brief >> ${join(JOURNAL_DIR, "cron.log")} 2>&1
-30 18 * * 1-5 ${self} --wrap  >> ${join(JOURNAL_DIR, "cron.log")} 2>&1
+  if (platform === "linux" || platform === "macos-cron") {
+    process.stdout.write(`# stonedog-ask — two runs a day.  Install with: crontab -e
+#
+# PATH is explicit because cron gives a job almost nothing: no profile, no nvm,
+# typically just /usr/bin:/bin. MAILTO="" stops cron mailing you every run.
+# Credentials are resolved by ask-copilot itself, which is the whole reason the
+# workstation secret is a source — a cron job never ran \`load-secrets\`.
 
-# Verify the pair before trusting them, in this order:
-#   ${self} --check
-#   ${self} --sources
-#   ${self} --brief --dry-run
+SHELL=/bin/sh
+MAILTO=""
+PATH=${cronPath}
+
+45 6 * * 1-5  ${self} --brief >> ${log} 2>&1
+30 18 * * 1-5 ${self} --wrap  >> ${log} 2>&1
 `);
-  process.exit(0);
+    process.exit(0);
+  }
+
+  if (platform === "systemd") {
+    const unit = (kind, cal) => `# ~/.config/systemd/user/ask-copilot-${kind}.service
+[Unit]
+Description=ask-copilot ${kind}
+
+[Service]
+Type=oneshot
+Environment=PATH=${cronPath}
+ExecStart=${self} --${kind}
+StandardOutput=append:${log}
+StandardError=append:${log}
+
+# ~/.config/systemd/user/ask-copilot-${kind}.timer
+[Unit]
+Description=ask-copilot ${kind}
+
+[Timer]
+OnCalendar=${cal}
+# Runs a MISSED job once after boot — the whole reason to prefer a timer to
+# cron on a laptop, which is asleep at 06:45 more often than not.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`;
+    process.stdout.write(`${unit("brief", "Mon..Fri 06:45")}
+${unit("wrap", "Mon..Fri 18:30")}
+# Then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ask-copilot-brief.timer ask-copilot-wrap.timer
+#   systemctl --user list-timers 'ask-copilot-*'
+#
+# And once, or the timers stop the moment you log out:
+#   loginctl enable-linger $USER
+`);
+    process.exit(0);
+  }
+
+  if (platform === "macos") {
+    // StartCalendarInterval takes an ARRAY of dicts. There is no weekday range
+    // in launchd, so Mon-Fri is five entries; a single dict with Weekday 1-5 is
+    // a common guess that silently runs on Mondays only.
+    const days = [1, 2, 3, 4, 5]
+      .map((d) => `      <dict><key>Weekday</key><integer>${d}</integer>` +
+                  `<key>Hour</key><integer>HH</integer>` +
+                  `<key>Minute</key><integer>MM</integer></dict>`)
+      .join("\n");
+    const plist = (kind, hh, mm) => `<!-- ~/Library/LaunchAgents/com.stonedog.ask-copilot.${kind}.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.stonedog.ask-copilot.${kind}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${self}</string>
+    <string>--${kind}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${cronPath}</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+${days.replace(/HH/g, String(hh)).replace(/MM/g, String(mm))}
+  </array>
+  <key>StandardOutPath</key><string>${log}</string>
+  <key>StandardErrorPath</key><string>${log}</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+`;
+    process.stdout.write(`${plist("brief", 6, 45)}
+${plist("wrap", 18, 30)}
+<!--
+Then, for each plist (bootstrap/bootout, not the deprecated load/unload):
+
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stonedog.ask-copilot.brief.plist
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stonedog.ask-copilot.wrap.plist
+  launchctl list | grep ask-copilot
+
+To change one, bootout first — bootstrap on an already-loaded label fails:
+
+  launchctl bootout gui/$(id -u)/com.stonedog.ask-copilot.brief
+
+launchd runs a MISSED calendar job once the machine wakes, where cron simply
+skips it. On a laptop that is the difference between a brief most mornings and
+a brief on the mornings you happened to be awake before 06:45.
+
+If the job needs to read Mail, Calendar or anything else macOS protects, grant
+Full Disk Access to the binary in ProgramArguments (System Settings > Privacy &
+Security). Without it the job runs and quietly reads nothing.
+-->
+`);
+    process.exit(0);
+  }
+
+  process.stderr.write(`ask-copilot: unknown platform "${platform}" — expected linux, systemd, or macos\n`);
+  process.exit(2);
 }
 
 if (opts.mode === "sources") {
