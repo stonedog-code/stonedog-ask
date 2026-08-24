@@ -1,0 +1,795 @@
+#!/usr/bin/env node
+/**
+ * ask-gemini — hand a question, a document, or a whole repository to Gemini.
+ *
+ * The division of labour this implements (see ~/.claude/CLAUDE.md, "Working
+ * with two models"): Gemini reviews and digests, Claude implements. Gemini's
+ * context window swallows a monorepo in one pass and it is good at spotting the
+ * constraint a proposal forgot; Claude is better at precise edits and test
+ * suites. Neither observation is worth much unless handing work across is one
+ * command, so this is that command.
+ *
+ *   ask-gemini "does a UNION read beat storing both directions?"
+ *   ask-gemini --review-prd docs/prd/related-content.md
+ *   ask-gemini --review-plan docs/plan.md
+ *   ask-gemini --review-diff                  # the working tree's diff vs HEAD
+ *   ask-gemini --repo . "where does auth actually get enforced?"
+ *   ask-gemini --file a.ts --file b.ts "do these two agree about null?"
+ *   ask-gemini --check                        # credentials only, no call
+ *
+ * Every call is appended to ~/.claude/ai-usage/gemini.jsonl so `get-gemini-usage`
+ * has something true to report. See the note on token counts below — they are
+ * estimates, and the ledger says so on every row rather than in a footnote.
+ */
+
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, resolve } from "node:path";
+import { join } from "node:path";
+
+import { GEMINI_LEDGER, appendLedger, fmtInt } from "../lib/ai-usage-lib.mjs";
+
+// gemini-2.5-pro is still LISTED by the models endpoint but is not callable on a
+// new key -- "no longer available to new users". Listing is not entitlement, so
+// pick the default from a model that has actually answered.
+const DEFAULT_MODEL = "gemini-3.1-pro-preview";
+
+/**
+ * A single file is capped so one accidental `--file node_modules/...` cannot
+ * silently become the whole prompt. The repo mode has its own, larger budget.
+ */
+const MAX_FILE_BYTES = 2_000_000;
+const MAX_REPO_BYTES = 40_000_000;
+
+// ── Review criteria ───────────────────────────────────────────────────────
+//
+// The criteria are here, in the tool, rather than retyped per invocation.
+// A review whose brief changes every time is a review whose findings cannot be
+// compared with last week's, and the whole reason to ask a second model is to
+// get the constraint the first one did not think to check.
+
+const PRD_CRITERIA = `Review this as a product requirements document. Be specific and adversarial; agreeing with it is not useful to me.
+
+Cover, in this order, and skip a heading only if it genuinely does not apply:
+
+1. MISSED CONSTRAINTS. What does this document assume without stating? Name anything it would break that it has not mentioned.
+2. EDGE CASES. Concrete inputs or sequences where the described behaviour is wrong, ambiguous, or undefined. Prefer specific scenarios over categories.
+3. DATA MODEL ACROSS BACKENDS. If it specifies storage, check the schema and queries against SQLite, PostgreSQL, MySQL and MariaDB. Name any DDL, type, index-length, constraint-enforcement or dialect difference that would fail or silently behave differently on one of them.
+4. MIGRATION AND BREAKING CHANGES. What breaks for existing consumers? Is the stated migration path actually sufficient, and is there a step it forgot?
+5. NON-FUNCTIONAL REQUIREMENTS. Performance, concurrency, failure modes, observability, security, access control, and what happens on partial failure.
+6. INTERNAL CONTRADICTIONS. Places where two parts of the document require different things.
+7. WHAT I SHOULD CUT. Scope that is not carrying its weight.
+
+For each finding give: the section it applies to, the concrete failure, and how confident you are. If you have no finding under a heading, write "none" rather than padding.`;
+
+const PLAN_CRITERIA = `Review this as an implementation plan. Be specific and adversarial.
+
+Cover: ordering mistakes (a step that depends on a later one); steps that cannot be verified when they land; hidden coupling between steps that are described as independent; anything that will be discovered only after a lot of work has been done; and rollback — what happens if step N ships and step N+1 turns out to be wrong.
+
+For each finding give the step number, the concrete problem, and a suggested fix.`;
+
+const DIFF_CRITERIA = `Review this diff. Focus on correctness and on what it breaks elsewhere, not on style.
+
+Cover: bugs and wrong edge-case handling; behaviour changes not implied by the stated intent; anything the tests in the diff do not actually pin; and cross-cutting effects on callers not shown in the diff.
+
+For each finding give file:line, the concrete failure scenario, and how confident you are.`;
+
+// ── Argument parsing ──────────────────────────────────────────────────────
+
+function usage(code = 0) {
+  const out = code === 0 ? process.stdout : process.stderr;
+  out.write(`ask-gemini — hand work to Gemini
+
+  ask-gemini [options] "question"
+
+Modes (at most one):
+  --review-prd FILE     structured PRD critique
+  --review-plan FILE    implementation-plan critique
+  --review-diff [REF]   critique a diff (default: working tree vs HEAD)
+  --repo [DIR]          include every git-tracked text file under DIR
+  --check               verify credentials and exit; makes no model call
+
+Options:
+  --file FILE           attach a file as context (repeatable)
+  -m, --model NAME      default ${DEFAULT_MODEL}
+  --out FILE            also write the reply to FILE
+  --raw                 print only the reply, no header or usage line
+  --dry-run             print the assembled prompt and exit
+  -h, --help
+
+Every call is logged to ~/.claude/ai-usage/gemini.jsonl. Read it back with
+get-gemini-usage.
+`);
+  process.exit(code);
+}
+
+function parseArgs(argv) {
+  const opts = { files: [], model: DEFAULT_MODEL, prompt: [], mode: null, modeArg: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const setMode = (name, arg) => {
+      if (opts.mode) {
+        process.stderr.write(`ask-gemini: --${name} conflicts with --${opts.mode}\n`);
+        process.exit(2);
+      }
+      opts.mode = name;
+      opts.modeArg = arg;
+    };
+    switch (a) {
+      case "-h":
+      case "--help":
+        usage(0);
+        break;
+      case "--check":
+        setMode("check", null);
+        break;
+      case "--review-prd":
+        setMode("review-prd", argv[++i]);
+        break;
+      case "--review-plan":
+        setMode("review-plan", argv[++i]);
+        break;
+      case "--review-diff":
+        // Optional argument: only consume the next token if it is not a flag.
+        setMode("review-diff", argv[i + 1] && !argv[i + 1].startsWith("-") ? argv[++i] : null);
+        break;
+      case "--repo":
+        setMode("repo", argv[i + 1] && !argv[i + 1].startsWith("-") ? argv[++i] : ".");
+        break;
+      case "--file":
+        opts.files.push(argv[++i]);
+        break;
+      case "-m":
+      case "--model":
+        opts.model = argv[++i];
+        break;
+      case "--out":
+        opts.out = argv[++i];
+        break;
+      case "--raw":
+        opts.raw = true;
+        break;
+      case "--dry-run":
+        opts.dryRun = true;
+        break;
+      default:
+        if (a.startsWith("-")) {
+          process.stderr.write(`ask-gemini: unknown option ${a}\n`);
+          usage(2);
+        }
+        opts.prompt.push(a);
+    }
+  }
+  return opts;
+}
+
+// ── Credentials ───────────────────────────────────────────────────────────
+
+/**
+ * The environment the CLI is given, with the variables that hijack auth removed.
+ *
+ * Four variables silently change which backend the CLI talks to, and each
+ * produces an error that describes something other than itself:
+ *
+ * - `GEMINI_API_KEY` / `GOOGLE_API_KEY` override OAuth entirely, so a stale key
+ *   breaks a working browser login and reports "API key not valid".
+ * - `GOOGLE_CLOUD_PROJECT` / `GOOGLE_GENAI_USE_VERTEXAI` route OAuth through
+ *   Cloud Code Companion against that project, which fails with a **403 IAM
+ *   permission** error naming a project the user never chose — it reads as a
+ *   broken Google account rather than as an inherited variable.
+ *
+ * A long-lived process (an editor, an agent session) captures its environment
+ * at start, so a user who fixes their shell profile does NOT fix this process —
+ * which is exactly how the same command works in one terminal and fails in
+ * another. Stripping them here makes the tool behave the same in both.
+ *
+ * `--api-key` remains the way to use a key deliberately; inheriting one by
+ * accident is what this prevents.
+ *
+ * ## Where the key actually lives (changed 2026-08-22)
+ *
+ * It used to be a plaintext `export GOOGLE_API_KEY=` in `~/.bashrc`, which is
+ * why the fallback below reads a login shell. That line is gone: the four
+ * workstation credentials moved to **AWS Secrets Manager, `workstation/nehsa`**
+ * (us-west-2, CMK `alias/workstation-secrets`), read by profile `hopperguard`,
+ * and `~/.zsh-secrets.zsh` defines `load-secrets` to pull them into a shell on
+ * demand. Nothing is fetched at shell start, deliberately — having
+ * `GOOGLE_API_KEY` and `GOOGLE_CLOUD_PROJECT` in every shell is what made a
+ * bare `gemini` unusable in the first place.
+ *
+ * **That is exactly why this tool broke.** Its only fallback asked
+ * `bash -ic` for the variable, and after the migration no shell exports it
+ * until someone runs `load-secrets`. So `ask-gemini --check` reported
+ * *"No OAuth credentials and no API key"* on a machine whose key was sitting
+ * in Secrets Manager, correct and reachable — a true statement about the
+ * environment and a false one about the credential.
+ *
+ * So the secret is now a first-class source, ahead of the shell probe: this
+ * tool reads it directly and needs no `load-secrets` in its caller. The shell
+ * probe stays last, for a key someone exports by hand.
+ */
+function keyWorks(key) {
+  if (!key) return false;
+  const probe = spawnSync(
+    "curl",
+    ["-s", "-o", "/dev/null", "-w", "%{http_code}", `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+  return probe.stdout?.trim() === "200";
+}
+
+/**
+ * The workstation secret — the canonical home of these credentials.
+ *
+ * Mirrors the defaults and the cache location of `~/.zsh-secrets.zsh` so the
+ * two cannot disagree about where the key is, and honours the same
+ * `WS_SECRET_*` overrides.
+ *
+ * **Read-only, deliberately.** A fresh cache is reused (that is what makes the
+ * common path free); a stale or missing one falls through to AWS, and the
+ * result is NOT written back. Writing it would duplicate `load-secrets`'
+ * 0600-dir-and-file handling in a second language, and getting file modes
+ * wrong on a file holding four live credentials is a worse outcome than one
+ * extra `aws` call per run.
+ *
+ * Memoised as `{}` on any failure, so a machine with no AWS access pays the
+ * timeout once rather than once per candidate key.
+ */
+const WS = {
+  id: process.env.WS_SECRET_ID || "workstation/nehsa",
+  profile: process.env.WS_SECRET_PROFILE || "hopperguard",
+  region: process.env.WS_SECRET_REGION || "us-west-2",
+  ttl: Number(process.env.WS_SECRET_TTL || 43_200),
+};
+
+function wsCachePath() {
+  if (process.env.WS_SECRET_CACHE) return process.env.WS_SECRET_CACHE;
+  const base =
+    process.env.XDG_CACHE_HOME || join(process.env.HOME ?? "", ".cache");
+  // `${WS_SECRET_ID:gs_/_-_}` in the zsh original: slashes become dashes.
+  return join(base, "workstation-secrets", `${WS.id.replace(/\//g, "-")}.json`);
+}
+
+let wsSecret;
+function workstationSecret() {
+  if (wsSecret !== undefined) return wsSecret;
+  wsSecret = {};
+
+  const cache = wsCachePath();
+  try {
+    if (existsSync(cache) && (Date.now() - statSync(cache).mtimeMs) / 1000 <= WS.ttl) {
+      const parsed = JSON.parse(readFileSync(cache, "utf8"));
+      if (parsed && typeof parsed === "object") return (wsSecret = parsed);
+    }
+  } catch {
+    // A corrupt or unreadable cache is not fatal — go to the source.
+  }
+
+  const r = spawnSync(
+    "aws",
+    [
+      "secretsmanager", "get-secret-value",
+      "--profile", WS.profile,
+      "--region", WS.region,
+      "--secret-id", WS.id,
+      "--query", "SecretString",
+      "--output", "text",
+    ],
+    { encoding: "utf8", timeout: 30_000 },
+  );
+  if (r.status === 0 && r.stdout) {
+    try {
+      const parsed = JSON.parse(r.stdout);
+      if (parsed && typeof parsed === "object") wsSecret = parsed;
+    } catch {
+      // Not JSON. `--check` reports the absence; there is nothing to salvage.
+    }
+  }
+  return wsSecret;
+}
+
+function fromWorkstationSecret(name) {
+  const v = workstationSecret()[name];
+  return typeof v === "string" ? v.trim() : "";
+}
+
+/** A key's identity, printable. Never a prefix of the key itself. */
+const fingerprint = (key) => createHash("sha256").update(key).digest("hex").slice(0, 12);
+
+/**
+ * Read a variable from a fresh LOGIN shell.
+ *
+ * This is the escape from the stale-process trap: a long-lived process captured
+ * its environment at start, so a key the user has since added to their profile
+ * is invisible to it — and a key they have since REMOVED is still present and
+ * still overriding. Asking a login shell gets what a new terminal would see.
+ *
+ * The marker matters. This machine's profile prints a page of hints to stdout,
+ * so a bare `echo $VAR` returns the banner with the value buried in it; an
+ * earlier version of this script mistook that banner for a filesystem path.
+ */
+function fromLoginShell(name) {
+  // Ask the user's actual login shell. This hardcoded `bash` while the machine
+  // ran bash; it now runs zsh, so a key exported in a zsh profile was invisible
+  // to the one probe meant to find it. Both shells accept `-ic` and `printf`.
+  const shell = /(^|\/)(zsh|bash)$/.test(process.env.SHELL ?? "")
+    ? process.env.SHELL
+    : "bash";
+
+  // `-ic`, INTERACTIVE, not `-lc`.
+  //
+  // The standard `~/.bashrc` preamble returns early for non-interactive shells
+  // (`case $- in *i*) ;; *) return;; esac`), so anything exported below that
+  // guard — which is most of the file, and on this machine includes the working
+  // API key at line 259 — is invisible to `bash -lc`, to scripts, to CI, and to
+  // any agent. A login shell reads the profile and stops; an interactive one
+  // reads the whole thing, which is what a human's terminal actually has.
+  //
+  // `-i` also means the profile's banner lands on stdout, hence the marker: an
+  // earlier version parsed a page of system hints as a value.
+  const r = spawnSync(shell, ["-ic", `printf '<<<K>>>%s<<<E>>>' "$${name}"`], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  // Bounded at BOTH ends. An open-ended match swallows whatever the shell
+  // prints after the value — this machine's profile emits a page of hints, and
+  // an unterminated capture returned a 3,800-character "key" that was mostly
+  // banner. A trailing sentinel makes the value's end explicit.
+  const m = /<<<K>>>([\s\S]*?)<<<E>>>/.exec(r.stdout ?? "");
+  return m ? m[1].trim() : "";
+}
+
+let resolvedKey; // computed once per run — each probe is a network call
+let resolvedKeySource = null; // where it came from, so `--check` can say
+
+/**
+ * The environment the CLI is given: exactly one working key, and none of the
+ * variables that silently redirect auth somewhere else.
+ *
+ * Two variables hijack the backend rather than the credential —
+ * `GOOGLE_CLOUD_PROJECT` and `GOOGLE_GENAI_USE_VERTEXAI` route OAuth through
+ * Cloud Code Companion, which fails with a **403 IAM** error naming a project
+ * the user never chose. Those are always stripped.
+ *
+ * The API keys are different: one of them is probably the thing that works. So
+ * they are validated rather than trusted or discarded — the first that Google
+ * actually accepts is passed through as `GEMINI_API_KEY`, and the rest are
+ * removed so a stale one cannot win by precedence. An earlier version stripped
+ * all of them, which fixed the stale-key failure by throwing away the live key
+ * beside it.
+ */
+function geminiEnv() {
+  if (resolvedKey === undefined) {
+    // Ordered by cost and by trust. The current environment is free and is
+    // what `load-secrets` populates, so it wins when it works. The workstation
+    // secret is the canonical home and is consulted BEFORE any shell probe —
+    // that is the whole point: this tool must work in a session that never ran
+    // `load-secrets`, which is every agent and every cron job. The shell probe
+    // is last and now finds a key only if someone exported one by hand.
+    const sources = [
+      ["environment", () => [process.env.GEMINI_API_KEY, process.env.GOOGLE_API_KEY]],
+      [`${WS.id} (Secrets Manager)`, () => [fromWorkstationSecret("GOOGLE_API_KEY"), fromWorkstationSecret("GEMINI_API_KEY")]],
+      ["login shell profile", () => [fromLoginShell("GEMINI_API_KEY"), fromLoginShell("GOOGLE_API_KEY")]],
+    ];
+    resolvedKey = null;
+    for (const [label, candidates] of sources) {
+      const hit = candidates().find(keyWorks);
+      if (hit) {
+        resolvedKey = hit;
+        resolvedKeySource = label;
+        break;
+      }
+    }
+  }
+
+  const env = { ...process.env };
+  for (const k of ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_GENAI_USE_VERTEXAI"]) {
+    delete env[k];
+  }
+  // Only when one actually works. With no key the CLI falls back to OAuth,
+  // which is the correct path for an account whose entitlement is intact.
+  if (resolvedKey) env.GEMINI_API_KEY = resolvedKey;
+  return env;
+}
+
+/**
+ * Why this exists as its own mode.
+ *
+ * The Gemini CLI's failure when a credential is wrong is a 400 from Google
+ * wrapped in a JSON string inside another JSON string, and it exits ZERO. So a
+ * script that just shells out and trusts the exit code reports success and
+ * writes an empty answer to a file. Worse, an invalid GEMINI_API_KEY in the
+ * environment TAKES PRECEDENCE over a perfectly good OAuth login — so the
+ * symptom is "my credentials are broken" when the fix is to remove a variable.
+ */
+function checkCredentials() {
+  const problems = [];
+  const notes = [];
+
+  // `gemini --version`, not `bash -lc "command -v gemini"`.
+  //
+  // A login shell sources the profile, and this machine's profile prints a
+  // banner of system hints — which lands on stdout and becomes the "path" this
+  // reported. Running the binary directly asks the question with nothing else
+  // in the way, and its failure to exist is an ENOENT rather than a parse.
+  const bin = spawnSync("gemini", ["--version"], { encoding: "utf8", timeout: 30_000 });
+  if (bin.error?.code === "ENOENT") {
+    problems.push("The `gemini` CLI is not on PATH. Install it: npm i -g @google/gemini-cli");
+    return { ok: false, problems, notes };
+  }
+  if (bin.status !== 0) {
+    problems.push(`\`gemini --version\` exited ${bin.status}: ${(bin.stderr || bin.stdout || "").trim().slice(0, 200)}`);
+    return { ok: false, problems, notes };
+  }
+  notes.push(`gemini CLI version ${bin.stdout.trim() || "unknown"}`);
+
+  // Resolve through the same path a real call uses, so `--check` cannot pass on
+  // a credential the call would not have used.
+  const key = geminiEnv().GEMINI_API_KEY;
+  if (key) {
+    // A sha prefix, not `key.slice(0, 6)`. `--check` output lands in scrollback,
+    // in CI logs and in agent transcripts; `rotate-secret` next door compares
+    // credentials by sha for exactly that reason, and printing the first six
+    // characters of a live key for cosmetic recognisability is not worth it. A
+    // fingerprint still answers the only question asked of it — is this the
+    // same key as before.
+    notes.push(
+      `API key resolved from ${resolvedKeySource ?? "unknown"} (${key.length} chars, sha ${fingerprint(key)})`,
+    );
+    const probe = spawnSync(
+      "curl",
+      ["-s", "-o", "/dev/null", "-w", "%{http_code}", `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`],
+      { encoding: "utf8", timeout: 20_000 },
+    );
+    if (probe.stdout.trim() !== "200") {
+      // A note, not a problem, since `geminiEnv()` strips the key before every
+      // call — so a stale one inherited from a long-lived process no longer
+      // breaks anything here. It is still worth saying out loud, because it DOES
+      // break a bare `gemini` run in the same shell, and that difference is
+      // otherwise inexplicable.
+      notes.push(
+        `GEMINI_API_KEY is set and Google rejects it (HTTP ${probe.stdout.trim() || "no response"}) — ` +
+          `stripped before every call, so it is inert here. A bare \`gemini\` in this shell will still fail on it.`,
+      );
+    } else {
+      // Deliberately NOT an early return. A key the models endpoint accepts can
+      // still fail the actual call — a wrong tier, a disabled API, a project
+      // restriction — and this function's whole purpose is that the live probe
+      // below is the last word.
+      notes.push("API key accepted by generativelanguage.googleapis.com");
+    }
+  } else {
+    notes.push(
+      `No API key found in the environment, ${WS.id}, or a login shell — OAuth will be used`,
+    );
+  }
+
+  const creds = join(process.env.HOME ?? "", ".gemini", "oauth_creds.json");
+  if (existsSync(creds)) {
+    try {
+      const c = JSON.parse(readFileSync(creds, "utf8"));
+      const exp = c.expiry_date ? new Date(c.expiry_date) : null;
+      if (exp && exp < new Date()) {
+        problems.push(
+          `OAuth credentials expired ${exp.toISOString().slice(0, 10)}` +
+            (c.refresh_token ? " (a refresh token is present, but the CLI is not refreshing it)" : "") +
+            `\n    Fix: run \`gemini\` on its own and complete the browser login.`,
+        );
+      } else if (exp) {
+        notes.push(`OAuth credentials valid until ${exp.toISOString().slice(0, 10)}`);
+      }
+    } catch {
+      problems.push(`${creds} exists but is not readable JSON. Re-run \`gemini\` to log in again.`);
+    }
+  } else if (!key) {
+    // The advice has to name where the key actually lives. "export
+    // GEMINI_API_KEY" was true when this machine kept it in ~/.bashrc, and
+    // after the move to Secrets Manager it sent people to re-create a
+    // credential that already existed — or worse, to paste one back into a
+    // 644 dotfile, undoing the migration.
+    const inSecret = Boolean(
+      workstationSecret().GOOGLE_API_KEY || workstationSecret().GEMINI_API_KEY,
+    );
+    problems.push(
+      inSecret
+        ? `No OAuth credentials, and the key in ${WS.id} is not being accepted by Google.\n` +
+            `    Fix: mint a new one at https://aistudio.google.com/apikey and store it with\n` +
+            `    \`rotate-secret GOOGLE_API_KEY\` (zsh), or run \`gemini\` once to log in with OAuth.`
+        : `No OAuth credentials and no API key.\n` +
+            `    This machine keeps the key in AWS Secrets Manager as ${WS.id}\n` +
+            `    (${WS.region}, profile ${WS.profile}) — check that first:\n` +
+            `      aws secretsmanager get-secret-value --profile ${WS.profile} --region ${WS.region} \\\n` +
+            `        --secret-id ${WS.id} --query SecretString --output text | jq -r 'keys[]'\n` +
+            `    A missing GOOGLE_API_KEY there is set with \`rotate-secret GOOGLE_API_KEY\` (zsh).\n` +
+            `    Do NOT re-add it to a shell profile — that is what was migrated away from.\n` +
+            `    Otherwise run \`gemini\` once and complete the browser login.`,
+    );
+  }
+
+  if (problems.length > 0) return { ok: false, problems, notes };
+
+  /**
+   * A real call, because a valid credential is not an entitled one.
+   *
+   * This check used to stop above and report "ready" on the strength of an
+   * unexpired token — and it was wrong in the way that matters most: the
+   * account's free Code Assist tier had been discontinued, so every credential
+   * was genuinely valid and every call still failed. A green check that a first
+   * real call disproves is worse than no check, because it sends you looking at
+   * the prompt instead of the account.
+   *
+   * One token, cheapest model. The cost of the probe is far below the cost of
+   * discovering this in the middle of a review.
+   */
+  const probe = spawnSync(
+    "gemini",
+    ["--skip-trust", "-m", "gemini-2.5-flash", "-p", "Reply with the single word: ok"],
+    { env: geminiEnv(), encoding: "utf8", timeout: 120_000 },
+  );
+  const out = `${probe.stdout ?? ""}${probe.stderr ?? ""}`;
+
+  if (/IneligibleTierError|no longer supported for Gemini Code Assist/i.test(out)) {
+    problems.push(
+      "Google has discontinued this account's free Gemini Code Assist tier for the CLI.\n" +
+        "    The OAuth login is valid; the entitlement behind it is gone, so every call fails.\n" +
+        "    Fix: mint an API key at https://aistudio.google.com/apikey and export GEMINI_API_KEY\n" +
+        "    (a paid, per-token path), or use a Google account that still carries the entitlement.",
+    );
+  } else if (/cloudaicompanion|permission .* denied/i.test(out)) {
+    problems.push(
+      "OAuth is being routed through Cloud Code Companion and denied by IAM.\n" +
+        "    Usually an inherited GOOGLE_CLOUD_PROJECT. This tool strips it, so if you see\n" +
+        "    this from `gemini` directly and not from `ask-gemini`, that is the cause.",
+    );
+  } else if (probe.error || !probe.stdout?.trim() || /^\[API Error:|"code":\s*[45]\d\d/.test(probe.stdout.trim())) {
+    problems.push(`A live probe call failed: ${(out.trim() || "no output").slice(0, 300)}`);
+  } else {
+    notes.push(`live probe succeeded (${probe.stdout.trim().slice(0, 40)})`);
+  }
+
+  return { ok: problems.length === 0, problems, notes };
+}
+
+// ── Context assembly ──────────────────────────────────────────────────────
+
+function readTextFile(path, budget) {
+  const full = resolve(path);
+  if (!existsSync(full)) {
+    process.stderr.write(`ask-gemini: no such file: ${path}\n`);
+    process.exit(2);
+  }
+  const size = statSync(full).size;
+  if (size > budget) {
+    process.stderr.write(`ask-gemini: ${path} is ${fmtInt(size)} bytes, over the ${fmtInt(budget)} limit\n`);
+    process.exit(2);
+  }
+  return readFileSync(full, "utf8");
+}
+
+function fence(path, body) {
+  // A path-labelled fence, because a reviewer that cannot cite a file cannot be
+  // acted on — "somewhere in the schema" is not a finding anyone can fix.
+  return `\n===== FILE: ${path} =====\n${body}\n===== END: ${path} =====\n`;
+}
+
+/** Every git-tracked file under `dir` that looks like text and fits the budget. */
+function repoContext(dir) {
+  let list;
+  try {
+    list = execFileSync("git", ["-C", dir, "ls-files"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  } catch {
+    process.stderr.write(`ask-gemini: ${dir} is not a git repository (--repo lists git-tracked files)\n`);
+    process.exit(2);
+  }
+  // git-tracked only, deliberately: it is the one definition of "the source"
+  // that already excludes node_modules, build output and secrets, and it is the
+  // definition the repository itself maintains.
+  const skip = /\.(png|jpe?g|gif|webp|ico|svg|pdf|zip|gz|tgz|woff2?|ttf|eot|mp4|mp3|wav|db|sqlite3?|lock)$/i;
+  let bytes = 0;
+  const parts = [];
+  const skipped = [];
+  for (const rel of list.split("\n").filter(Boolean)) {
+    if (skip.test(rel) || rel.endsWith("package-lock.json")) continue;
+    const full = join(dir, rel);
+    let st;
+    try {
+      st = statSync(full);
+    } catch {
+      continue; // tracked but deleted in the working tree
+    }
+    if (!st.isFile()) continue;
+    if (bytes + st.size > MAX_REPO_BYTES) {
+      skipped.push(rel);
+      continue;
+    }
+    const body = readFileSync(full, "utf8");
+    // A NUL byte, written as an escape rather than as a literal control
+    // character inside quotes: the literal renders as a space in every diff
+    // and review tool, so nobody can see what this actually tests.
+    if (body.indexOf("\u0000") !== -1) continue;
+    bytes += st.size;
+    parts.push(fence(rel, body));
+  }
+  // Truncation is announced, never silent. A digest that quietly dropped half
+  // the repository still answers confidently, and the answer looks the same.
+  if (skipped.length) {
+    process.stderr.write(
+      `ask-gemini: repo context hit the ${fmtInt(MAX_REPO_BYTES)}-byte budget; ` +
+        `${skipped.length} file(s) omitted, first: ${skipped[0]}\n`,
+    );
+  }
+  return { text: parts.join(""), fileCount: parts.length, bytes, skipped: skipped.length };
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────
+
+const opts = parseArgs(process.argv.slice(2));
+
+if (opts.mode === "check") {
+  const c = checkCredentials();
+  for (const n of c.notes) process.stdout.write(`  ${n}\n`);
+  if (c.ok) {
+    process.stdout.write("\nask-gemini: ready.\n");
+    process.exit(0);
+  }
+  process.stdout.write("\nask-gemini: NOT ready.\n");
+  for (const p of c.problems) process.stdout.write(`  ✗ ${p}\n`);
+  process.exit(1);
+}
+
+let instruction = opts.prompt.join(" ").trim();
+let context = "";
+let subject = null;
+
+switch (opts.mode) {
+  case "review-prd": {
+    if (!opts.modeArg) usage(2);
+    subject = opts.modeArg;
+    context = fence(opts.modeArg, readTextFile(opts.modeArg, MAX_FILE_BYTES));
+    instruction = `${PRD_CRITERIA}${instruction ? `\n\nAlso specifically address: ${instruction}` : ""}`;
+    break;
+  }
+  case "review-plan": {
+    if (!opts.modeArg) usage(2);
+    subject = opts.modeArg;
+    context = fence(opts.modeArg, readTextFile(opts.modeArg, MAX_FILE_BYTES));
+    instruction = `${PLAN_CRITERIA}${instruction ? `\n\nAlso specifically address: ${instruction}` : ""}`;
+    break;
+  }
+  case "review-diff": {
+    const ref = opts.modeArg;
+    const args = ref ? ["diff", ref] : ["diff", "HEAD"];
+    let diff;
+    try {
+      diff = execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    } catch (err) {
+      process.stderr.write(`ask-gemini: git ${args.join(" ")} failed: ${err.message}\n`);
+      process.exit(2);
+    }
+    if (!diff.trim()) {
+      process.stderr.write(`ask-gemini: git ${args.join(" ")} is empty — nothing to review\n`);
+      process.exit(2);
+    }
+    subject = `git ${args.join(" ")}`;
+    context = fence(subject, diff);
+    instruction = `${DIFF_CRITERIA}${instruction ? `\n\nAlso specifically address: ${instruction}` : ""}`;
+    break;
+  }
+  case "repo": {
+    const r = repoContext(opts.modeArg);
+    subject = `${opts.modeArg} (${r.fileCount} files)`;
+    context = r.text;
+    if (!instruction) {
+      process.stderr.write("ask-gemini: --repo needs a question\n");
+      process.exit(2);
+    }
+    break;
+  }
+  default: {
+    if (!instruction) usage(2);
+  }
+}
+
+for (const f of opts.files) context += fence(f, readTextFile(f, MAX_FILE_BYTES));
+
+const prompt = context
+  ? `${context}\n\n----------------\n${instruction}\n`
+  : `${instruction}\n`;
+
+if (opts.dryRun) {
+  process.stdout.write(prompt);
+  process.exit(0);
+}
+
+const cred = checkCredentials();
+if (!cred.ok) {
+  process.stderr.write("ask-gemini: cannot call Gemini.\n");
+  for (const p of cred.problems) process.stderr.write(`  ✗ ${p}\n`);
+  process.stderr.write("\nRun `ask-gemini --check` after fixing.\n");
+  process.exit(1);
+}
+
+// The prompt goes in on stdin and the instruction repeats on -p.
+//
+// Not for redundancy: a whole-repo prompt is tens of megabytes and would exceed
+// ARG_MAX as an argv string, failing with a bare E2BIG that reads like a broken
+// install. stdin has no such limit. -p carries the instruction again so it is
+// the last thing the model reads rather than the first.
+const started = Date.now();
+const run = spawnSync("gemini", ["--skip-trust", "-m", opts.model, "-p", instruction], {
+  input: prompt,
+  env: geminiEnv(),
+  encoding: "utf8",
+  maxBuffer: 128 * 1024 * 1024,
+  timeout: 20 * 60 * 1000,
+});
+
+const reply = (run.stdout ?? "").trim();
+const stderr = (run.stderr ?? "").trim();
+
+// The CLI exits 0 on an API error and prints the error to stdout, so the exit
+// code is not the signal. Check the payload.
+const failed =
+  run.status !== 0 ||
+  run.error ||
+  !reply ||
+  /^\[API Error:/.test(reply) ||
+  /"code":\s*4\d\d/.test(reply);
+
+if (failed) {
+  process.stderr.write("ask-gemini: the call failed.\n");
+  if (run.error) process.stderr.write(`  ${run.error.message}\n`);
+  if (reply) process.stderr.write(`  ${reply.slice(0, 800)}\n`);
+  if (stderr) process.stderr.write(`  ${stderr.slice(0, 800)}\n`);
+  if (/API_KEY_INVALID|API key not valid/.test(reply + stderr)) {
+    process.stderr.write(
+      `\n  The API key (from ${resolvedKeySource ?? "an unknown source"}) is invalid, and it overrides OAuth.\n` +
+        "  Mint a new key at https://aistudio.google.com/apikey, then store it with\n" +
+        "  `rotate-secret GOOGLE_API_KEY` (zsh) — not in a shell profile.\n" +
+        "  Or clear it and run `gemini` to log in with OAuth instead.\n",
+    );
+  }
+  process.exit(1);
+}
+
+/**
+ * Token counts are ESTIMATES, and every ledger row says so.
+ *
+ * The Gemini CLI does not report `usageMetadata` in non-interactive mode, so
+ * there is no measured number to record. Four characters per token is the usual
+ * English approximation and it is wrong for code — but a labelled estimate is
+ * useful and an unlabelled one is a lie a dashboard will repeat with two decimal
+ * places. If the CLI ever exposes real counts, `estimated` becomes false and
+ * nothing else about the ledger changes.
+ */
+const estIn = Math.ceil(prompt.length / 4);
+const estOut = Math.ceil(reply.length / 4);
+
+appendLedger(GEMINI_LEDGER, {
+  ts: new Date().toISOString(),
+  model: opts.model,
+  mode: opts.mode ?? "ask",
+  subject,
+  cwd: process.cwd(),
+  durationMs: Date.now() - started,
+  estimated: true,
+  usage: { input: estIn, output: estOut, cacheWrite: 0, cacheRead: 0, calls: 1 },
+});
+
+if (opts.out) {
+  writeFileSync(opts.out, reply + "\n", "utf8");
+}
+
+if (opts.raw) {
+  process.stdout.write(reply + "\n");
+} else {
+  const head = subject ? `gemini ${opts.model} · ${opts.mode} · ${basename(subject)}` : `gemini ${opts.model}`;
+  process.stdout.write(`── ${head} ──\n\n${reply}\n\n`);
+  process.stdout.write(
+    `── ~${fmtInt(estIn)} in / ~${fmtInt(estOut)} out (estimated) · ` +
+      `${((Date.now() - started) / 1000).toFixed(1)}s` +
+      (opts.out ? ` · written to ${opts.out}` : "") +
+      ` ──\n`,
+  );
+}
