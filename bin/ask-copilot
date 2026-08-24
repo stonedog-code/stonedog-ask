@@ -1,0 +1,576 @@
+#!/usr/bin/env node
+/**
+ * ask-copilot — hand a question, or a whole working day, to GitHub Copilot CLI.
+ *
+ * Built for two cron runs rather than for interactive use:
+ *
+ *   ask-copilot --brief          # start of day: what is due, what needs me
+ *   ask-copilot --wrap           # end of day:   what moved, what slipped
+ *   ask-copilot "question"       # one-off
+ *   ask-copilot --check          # credentials AND entitlement, real call
+ *   ask-copilot --cron           # print crontab lines for the two runs
+ *
+ * Copilot CLI is AGENTIC, which is the reason to use it here rather than a
+ * one-shot model: with MCP servers configured it can go and read mail, a
+ * SharePoint site or an issue tracker itself, instead of being handed a blob
+ * somebody else had to assemble. That is also the reason for the conservative
+ * defaults below — an agent with tools, running unattended at 06:45 against a
+ * work account, is a different risk from one you are watching.
+ *
+ * Every call is appended to ~/.claude/ai-usage/copilot.jsonl, and every brief
+ * and wrap is appended to the day journal so the pair form one record.
+ */
+
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+import { COPILOT_LEDGER, appendLedger, fmtInt } from "../lib/ai-usage-lib.mjs";
+import {
+  WS,
+  fingerprint,
+  fromLoginShell,
+  fromWorkstationSecret,
+  resolveCredential,
+  strippedEnv,
+  workstationSecret,
+} from "../lib/credentials.mjs";
+import { BRIEF_CRITERIA, WRAP_CRITERIA } from "../lib/prompts.mjs";
+import {
+  JOURNAL_DIR,
+  entryFor,
+  openItemsOf,
+  recentEntries,
+  today,
+  writeEntry,
+} from "../lib/journal.mjs";
+
+const CONFIG_PATH =
+  process.env.ASK_COPILOT_CONFIG || join(homedir(), ".stonedog-ask", "copilot.json");
+
+/** Where Copilot CLI keeps its MCP servers. `--check` reads it; nothing writes it. */
+const MCP_CONFIG =
+  process.env.COPILOT_MCP_CONFIG || join(homedir(), ".copilot", "mcp-config.json");
+
+/**
+ * The base argv every call gets.
+ *
+ * `-p` runs one prompt non-interactively and exits. `-s` suppresses the stats
+ * and decoration so stdout is the answer and nothing else — which matters when
+ * the caller is a cron job appending to a file. `--no-ask-user` stops it
+ * pausing for a clarifying question no one is there to answer; without it an
+ * unattended run can block until its timeout and produce nothing.
+ *
+ * Note what is NOT here: `--allow-all-tools`. See `toolArgs()`.
+ */
+const BASE_ARGS = ["-s", "--no-ask-user"];
+
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+
+// ── Argument parsing ──────────────────────────────────────────────────────
+
+function usage(code = 0) {
+  const out = code === 0 ? process.stdout : process.stderr;
+  out.write(`ask-copilot — hand work to GitHub Copilot CLI
+
+  ask-copilot [options] "question"
+
+Modes (at most one):
+  --brief               start-of-day brief, appended to the journal
+  --wrap                end-of-day wrap, appended to the journal
+  --check               verify credentials, entitlement and sources; makes one
+                        small real call
+  --cron                print suggested crontab lines and exit
+  --sources             list configured MCP sources and exit
+
+Options:
+  --source NAME         require this MCP source; repeatable. Refuses to run if
+                        it is not configured, instead of quietly omitting it
+  --days N              journal entries to carry forward as context (default 3)
+  --cwd DIR             directory to run in (default: the journal dir)
+  --allow-all-tools     let Copilot use every tool, including shell. Off by
+                        default; read the note in the source before using it
+  --arg X               extra argument passed through to copilot; repeatable
+  --timeout SECONDS     default ${DEFAULT_TIMEOUT_MS / 1000}
+  --out FILE            also write the reply to FILE
+  --no-journal          do not append to the journal (brief/wrap only)
+  --raw                 print only the reply, no header or usage line
+  --dry-run             print the assembled prompt and the argv, then exit
+  -h, --help
+
+Config:  ${CONFIG_PATH}
+Journal: ${JOURNAL_DIR}
+Ledger:  ~/.claude/ai-usage/copilot.jsonl
+`);
+  process.exit(code);
+}
+
+function parseArgs(argv) {
+  const opts = { prompt: [], sources: [], extra: [], mode: null, days: 3, timeoutMs: DEFAULT_TIMEOUT_MS };
+  const setMode = (name) => {
+    if (opts.mode) {
+      process.stderr.write(`ask-copilot: --${name} conflicts with --${opts.mode}\n`);
+      process.exit(2);
+    }
+    opts.mode = name;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h": case "--help": usage(0); break;
+      case "--brief": setMode("brief"); break;
+      case "--wrap": setMode("wrap"); break;
+      case "--check": setMode("check"); break;
+      case "--cron": setMode("cron"); break;
+      case "--sources": setMode("sources"); break;
+      case "--source": opts.sources.push(argv[++i]); break;
+      case "--days": opts.days = Number(argv[++i]); break;
+      case "--cwd": opts.cwd = argv[++i]; break;
+      case "--allow-all-tools": opts.allowAllTools = true; break;
+      case "--arg": opts.extra.push(argv[++i]); break;
+      case "--timeout": opts.timeoutMs = Number(argv[++i]) * 1000; break;
+      case "--out": opts.out = argv[++i]; break;
+      case "--no-journal": opts.noJournal = true; break;
+      case "--raw": opts.raw = true; break;
+      case "--dry-run": opts.dryRun = true; break;
+      default:
+        if (a.startsWith("-")) {
+          process.stderr.write(`ask-copilot: unknown option ${a}\n`);
+          usage(2);
+        }
+        opts.prompt.push(a);
+    }
+  }
+  if (!Number.isFinite(opts.days) || opts.days < 0) {
+    process.stderr.write("ask-copilot: --days expects a non-negative number\n");
+    process.exit(2);
+  }
+  if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) {
+    process.stderr.write("ask-copilot: --timeout expects a positive number of seconds\n");
+    process.exit(2);
+  }
+  return opts;
+}
+
+// ── Config ────────────────────────────────────────────────────────────────
+
+/**
+ * Optional operator config.
+ *
+ * `copilotArgs` replaces BASE_ARGS wholesale, and exists because this tool was
+ * written against Copilot CLI's documented flags without being able to run the
+ * binary. When a flag name here turns out to be wrong on your machine, the fix
+ * should be one line of JSON rather than a patch to this script:
+ *
+ *   { "copilotArgs": ["-s", "--no-ask-user"],
+ *     "allowTools":  ["mcp__mail", "mcp__sharepoint"],
+ *     "requireSources": ["mail", "sharepoint"],
+ *     "cwd": "/home/you/work" }
+ */
+function loadConfig() {
+  if (!existsSync(CONFIG_PATH)) return {};
+  try {
+    const c = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+    return c && typeof c === "object" ? c : {};
+  } catch (err) {
+    process.stderr.write(`ask-copilot: ${CONFIG_PATH} is not valid JSON (${err.message})\n`);
+    process.exit(2);
+  }
+}
+
+// ── Credentials ───────────────────────────────────────────────────────────
+
+const TOKEN_VARS = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+
+/**
+ * Does GitHub accept this token at all?
+ *
+ * Note what this does NOT establish: Copilot entitlement. A token can be
+ * perfectly valid, authenticate fine, and still be refused by Copilot because
+ * the fine-grained PAT lacks the "Copilot Requests" permission or the account
+ * has no seat. That is precisely the failure mode `--check`'s live probe exists
+ * for, and the reason this returns "usable as a credential" rather than "ready".
+ */
+function tokenWorks(token) {
+  if (!token) return false;
+  const probe = spawnSync(
+    "curl",
+    ["-s", "-o", "/dev/null", "-w", "%{http_code}",
+     "-H", `Authorization: Bearer ${token}`,
+     "-H", "Accept: application/vnd.github+json",
+     "https://api.github.com/user"],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+  return probe.stdout?.trim() === "200";
+}
+
+function fromGhCli() {
+  const r = spawnSync("gh", ["auth", "token"], { encoding: "utf8", timeout: 20_000 });
+  return r.status === 0 ? (r.stdout ?? "").trim() : "";
+}
+
+let resolved = null;
+
+/**
+ * The environment Copilot CLI is given: one token that works, under the name it
+ * looks for first, and none of the others.
+ *
+ * The three token variables are a precedence chain — `COPILOT_GITHUB_TOKEN`,
+ * then `GH_TOKEN`, then `GITHUB_TOKEN` — which means a stale value in an
+ * earlier one silently beats a good value in a later one. That is the same
+ * stale-key trap ask-gemini hit, in a different vendor's clothing: the symptom
+ * is "Copilot says I am not entitled" and the cause is a variable some other
+ * tool exported. So resolve deliberately, then strip all three and set only the
+ * winner.
+ *
+ * With no token at all, nothing is set and Copilot falls back to its own stored
+ * OAuth login — the correct path on a machine where somebody ran `copilot`
+ * interactively and completed the device flow.
+ */
+function copilotEnv() {
+  if (!resolved) {
+    resolved = resolveCredential(
+      [
+        ["environment", () => TOKEN_VARS.map((v) => process.env[v] ?? "")],
+        [`${WS.id} (Secrets Manager)`, () => TOKEN_VARS.map(fromWorkstationSecret)],
+        ["gh auth token", () => [fromGhCli()]],
+        ["login shell profile", () => TOKEN_VARS.map(fromLoginShell)],
+      ],
+      tokenWorks,
+    );
+  }
+  const env = strippedEnv(TOKEN_VARS);
+  if (resolved.secret) env.COPILOT_GITHUB_TOKEN = resolved.secret;
+  return env;
+}
+
+// ── Sources ───────────────────────────────────────────────────────────────
+
+/**
+ * The MCP servers Copilot CLI has configured.
+ *
+ * This tool deliberately does NOT create them. A mail or SharePoint connector
+ * is an authenticated integration with a consent flow behind it, and a wrapper
+ * that silently wrote one into place would be claiming an authorisation nobody
+ * granted. What it can honestly do is tell you which are present, and refuse to
+ * produce a brief that quietly omits one you asked for — because a brief with a
+ * missing source looks exactly like a quiet day.
+ */
+function configuredSources() {
+  if (!existsSync(MCP_CONFIG)) return { path: MCP_CONFIG, present: false, names: [] };
+  try {
+    const c = JSON.parse(readFileSync(MCP_CONFIG, "utf8"));
+    const servers = c.mcpServers ?? c.servers ?? c;
+    const names = servers && typeof servers === "object" ? Object.keys(servers) : [];
+    return { path: MCP_CONFIG, present: true, names };
+  } catch (err) {
+    return { path: MCP_CONFIG, present: true, names: [], error: err.message };
+  }
+}
+
+function requireSources(names) {
+  if (names.length === 0) return;
+  const have = new Set(configuredSources().names);
+  const missing = names.filter((n) => !have.has(n));
+  if (missing.length) {
+    process.stderr.write(
+      `ask-copilot: required source(s) not configured: ${missing.join(", ")}\n` +
+        `  Configured in ${MCP_CONFIG}: ${[...have].join(", ") || "(none)"}\n` +
+        `  Add one with \`copilot mcp add\`, or drop the --source flag to run without it.\n` +
+        `  Refusing rather than producing a brief that silently omits a source.\n`,
+    );
+    process.exit(2);
+  }
+}
+
+// ── Tool permissions ──────────────────────────────────────────────────────
+
+/**
+ * What the agent is allowed to do.
+ *
+ * Default: nothing beyond whatever Copilot permits without a grant. Reading
+ * mail to summarise it needs the MCP tools allowed, so real use will name them
+ * in `allowTools` — but naming them is a decision the operator makes once,
+ * visibly, in a config file, rather than a default this script chose for them.
+ *
+ * `--allow-all-tools` includes SHELL EXECUTION. In an interactive session that
+ * is a convenience; in a 06:45 cron job on a work machine it is an unattended
+ * agent with a shell, and the blast radius of a misread instruction in an email
+ * is no longer "a wrong summary". Prompt content is untrusted input here — the
+ * whole job is reading mail that other people wrote — so treat the flag as the
+ * exception it is.
+ */
+function toolArgs(opts, config) {
+  if (opts.allowAllTools) return ["--allow-all-tools"];
+  const allow = config.allowTools ?? [];
+  return allow.flatMap((t) => ["--allow-tool", t]);
+}
+
+// ── Check ─────────────────────────────────────────────────────────────────
+
+function checkCredentials() {
+  const problems = [];
+  const notes = [];
+
+  const bin = spawnSync("copilot", ["--version"], { encoding: "utf8", timeout: 60_000 });
+  if (bin.error?.code === "ENOENT") {
+    problems.push("The `copilot` CLI is not on PATH. Install it: npm i -g @github/copilot");
+    return { ok: false, problems, notes };
+  }
+  if (bin.status !== 0) {
+    problems.push(`\`copilot --version\` exited ${bin.status}: ${(bin.stderr || bin.stdout || "").trim().slice(0, 200)}`);
+    return { ok: false, problems, notes };
+  }
+  notes.push(`copilot CLI version ${bin.stdout.trim() || "unknown"}`);
+
+  const env = copilotEnv();
+  if (resolved.secret) {
+    notes.push(
+      `GitHub token resolved from ${resolved.source} ` +
+        `(${resolved.secret.length} chars, sha ${fingerprint(resolved.secret)}) — accepted by api.github.com`,
+    );
+  } else {
+    const inSecret = TOKEN_VARS.some((v) => workstationSecret()[v]);
+    notes.push(
+      inSecret
+        ? `A token exists in ${WS.id} but GitHub does not accept it — falling back to Copilot's own OAuth login`
+        : "No token in the environment, the workstation secret, gh, or a login shell — Copilot's own OAuth login will be used",
+    );
+  }
+
+  const src = configuredSources();
+  if (src.error) {
+    problems.push(`${src.path} exists but is not readable JSON (${src.error}).`);
+  } else if (!src.present) {
+    notes.push(`No MCP config at ${src.path} — Copilot has no external sources, so a brief can only report what it can reach without one`);
+  } else {
+    notes.push(`MCP sources configured: ${src.names.join(", ") || "(none)"}`);
+  }
+
+  if (problems.length > 0) return { ok: false, problems, notes };
+
+  /**
+   * A real call, because a valid credential is not an entitled one.
+   *
+   * This is the lesson ask-gemini paid for and it transfers exactly: a token
+   * that authenticates can still be refused for lack of a Copilot seat or the
+   * "Copilot Requests" permission on a fine-grained PAT. Every credential
+   * genuinely valid, every call failing — and a check that stopped one line
+   * above this would report "ready" and send you to debug the prompt.
+   */
+  const probe = spawnSync("copilot", [...BASE_ARGS, "-p", "Reply with the single word: ok"], {
+    env,
+    encoding: "utf8",
+    timeout: 180_000,
+    cwd: existsSync(JOURNAL_DIR) ? JOURNAL_DIR : homedir(),
+  });
+  const out = `${probe.stdout ?? ""}${probe.stderr ?? ""}`;
+
+  if (probe.error) {
+    problems.push(`A live probe call failed: ${probe.error.message}`);
+  } else if (/not (entitled|authorized)|no (copilot )?(seat|subscription)|quota|403/i.test(out)) {
+    problems.push(
+      `Copilot refused the call: ${out.trim().slice(0, 300)}\n` +
+        "    A token that authenticates is not a token with Copilot access. For automation the\n" +
+        "    PAT must be fine-grained WITH the \"Copilot Requests\" permission, and the account\n" +
+        "    needs a Copilot seat.",
+    );
+  } else if (probe.status !== 0 || !probe.stdout?.trim()) {
+    problems.push(`A live probe call produced nothing (exit ${probe.status}): ${out.trim().slice(0, 300) || "no output"}`);
+  } else {
+    notes.push(`live probe succeeded (${probe.stdout.trim().slice(0, 40)})`);
+  }
+
+  return { ok: problems.length === 0, problems, notes };
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────
+
+const opts = parseArgs(process.argv.slice(2));
+const config = loadConfig();
+
+if (opts.mode === "cron") {
+  const self = process.argv[1];
+  process.stdout.write(`# stonedog-ask — two runs a day. Adjust the times and the PATH.
+# Cron gets almost no environment, so give it an explicit PATH and let
+# ask-copilot resolve its own credentials (that is what the Secrets Manager
+# source is for — a cron job never ran \`load-secrets\`).
+
+PATH=${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}
+
+45 6 * * 1-5  ${self} --brief >> ${join(JOURNAL_DIR, "cron.log")} 2>&1
+30 18 * * 1-5 ${self} --wrap  >> ${join(JOURNAL_DIR, "cron.log")} 2>&1
+
+# Verify the pair before trusting them, in this order:
+#   ${self} --check
+#   ${self} --sources
+#   ${self} --brief --dry-run
+`);
+  process.exit(0);
+}
+
+if (opts.mode === "sources") {
+  const src = configuredSources();
+  process.stdout.write(`${src.path}\n`);
+  if (src.error) {
+    process.stdout.write(`  not valid JSON: ${src.error}\n`);
+    process.exit(1);
+  }
+  if (!src.present) {
+    process.stdout.write("  no MCP config — add one with `copilot mcp add`\n");
+    process.exit(1);
+  }
+  for (const n of src.names) process.stdout.write(`  ${n}\n`);
+  if (!src.names.length) process.stdout.write("  (none configured)\n");
+  process.exit(0);
+}
+
+if (opts.mode === "check") {
+  const c = checkCredentials();
+  for (const n of c.notes) process.stdout.write(`  ${n}\n`);
+  if (c.ok) {
+    process.stdout.write("\nask-copilot: ready.\n");
+    process.exit(0);
+  }
+  process.stdout.write("\nask-copilot: NOT ready.\n");
+  for (const p of c.problems) process.stdout.write(`  ✗ ${p}\n`);
+  process.exit(1);
+}
+
+requireSources([...(config.requireSources ?? []), ...opts.sources]);
+
+const day = today();
+let instruction = opts.prompt.join(" ").trim();
+let context = "";
+
+if (opts.mode === "brief" || opts.mode === "wrap") {
+  const criteria = opts.mode === "brief" ? BRIEF_CRITERIA : WRAP_CRITERIA;
+
+  // Carry the recent journal forward. This is what turns two summaries into a
+  // record: without it, "still open, fourth day" is a sentence nothing can
+  // produce, because no single day's sources contain it.
+  const prior = recentEntries(day, opts.days)
+    .map((e) => `===== JOURNAL ${e.day} =====\n${openItemsOf(e.text)}\n`)
+    .join("\n");
+
+  // The wrap also sees this morning's brief, so "slipped" can be measured
+  // against what was actually promised rather than re-derived.
+  const todays = opts.mode === "wrap" ? entryFor(day) : "";
+
+  context =
+    (prior ? `Previous journal entries, newest first. Carry forward anything still open, keeping its original "first seen" date.\n\n${prior}\n` : "") +
+    (todays ? `\n===== TODAY'S EARLIER ENTRY (${day}) =====\n${todays}\n` : "") +
+    (prior || todays ? "" : "There are no previous journal entries. This is the first run, so every open item you find is first seen today.\n");
+
+  instruction = `${criteria}\n\nToday is ${day}.${instruction ? `\n\nAlso specifically address: ${instruction}` : ""}`;
+} else if (!instruction) {
+  usage(2);
+}
+
+const prompt = context ? `${context}\n----------------\n${instruction}\n` : `${instruction}\n`;
+
+const argv = [
+  ...(config.copilotArgs ?? BASE_ARGS),
+  ...toolArgs(opts, config),
+  ...(config.extraArgs ?? []),
+  ...opts.extra,
+  "-p", prompt,
+];
+
+// A neutral working directory by default. Copilot is agentic and takes its
+// bearings from cwd; a brief launched from whatever directory cron happened to
+// start in can wander into an unrelated repo and summarise that instead.
+const cwd = opts.cwd ?? config.cwd ?? (existsSync(JOURNAL_DIR) ? JOURNAL_DIR : homedir());
+
+if (opts.dryRun) {
+  process.stdout.write(`# cwd: ${cwd}\n# argv: copilot ${argv.slice(0, -1).join(" ")} -p <prompt>\n\n${prompt}`);
+  process.exit(0);
+}
+
+const cred = checkCredentials();
+if (!cred.ok) {
+  process.stderr.write("ask-copilot: cannot call Copilot.\n");
+  for (const p of cred.problems) process.stderr.write(`  ✗ ${p}\n`);
+  process.stderr.write("\nRun `ask-copilot --check` after fixing.\n");
+  process.exit(1);
+}
+
+const started = Date.now();
+const run = spawnSync("copilot", argv, {
+  env: copilotEnv(),
+  cwd,
+  encoding: "utf8",
+  maxBuffer: 128 * 1024 * 1024,
+  timeout: opts.timeoutMs,
+});
+
+const reply = (run.stdout ?? "").trim();
+const stderr = (run.stderr ?? "").trim();
+
+// Key on the exit code AND on the payload. Empty output is not success, and a
+// timeout produces exactly that — a cron job that treated silence as a quiet
+// day would write an empty brief and look like it worked.
+const timedOut = run.error?.code === "ETIMEDOUT" || run.signal === "SIGTERM";
+const failed = run.status !== 0 || run.error || !reply;
+
+if (failed) {
+  process.stderr.write("ask-copilot: the call failed.\n");
+  if (timedOut) {
+    process.stderr.write(
+      `  Timed out after ${opts.timeoutMs / 1000}s with no output.\n` +
+        "  Copilot returns nothing at all when it hangs, so waiting longer buys nothing —\n" +
+        "  narrow the prompt or the source list rather than raising --timeout.\n",
+    );
+  }
+  if (run.error && !timedOut) process.stderr.write(`  ${run.error.message}\n`);
+  if (reply) process.stderr.write(`  ${reply.slice(0, 800)}\n`);
+  if (stderr) process.stderr.write(`  ${stderr.slice(0, 800)}\n`);
+  process.exit(1);
+}
+
+/**
+ * Token counts are ESTIMATES, and every ledger row says so.
+ *
+ * `-s` suppresses the stats Copilot would otherwise print, so there is no
+ * measured number to record here. Four characters per token is the usual
+ * English approximation and it is wrong for code — but a labelled estimate is
+ * useful and an unlabelled one is a lie a dashboard will repeat with two
+ * decimal places. Note also that this counts the prompt we sent, and an agentic
+ * run does its own tool calls on top, so the real figure is HIGHER than this by
+ * an unknown amount. `estimated: true` is carrying a lot of weight.
+ */
+const estIn = Math.ceil(prompt.length / 4);
+const estOut = Math.ceil(reply.length / 4);
+
+appendLedger(COPILOT_LEDGER, {
+  ts: new Date().toISOString(),
+  model: "copilot-cli",
+  mode: opts.mode ?? "ask",
+  subject: opts.mode === "brief" || opts.mode === "wrap" ? day : null,
+  cwd,
+  durationMs: Date.now() - started,
+  estimated: true,
+  agentic: true,
+  usage: { input: estIn, output: estOut, cacheWrite: 0, cacheRead: 0, calls: 1 },
+});
+
+let journalPath = null;
+if ((opts.mode === "brief" || opts.mode === "wrap") && !opts.noJournal) {
+  journalPath = writeEntry(day, opts.mode, reply);
+}
+
+if (opts.out) writeFileSync(opts.out, reply + "\n", "utf8");
+
+if (opts.raw) {
+  process.stdout.write(reply + "\n");
+} else {
+  process.stdout.write(`── copilot · ${opts.mode ?? "ask"}${opts.mode === "brief" || opts.mode === "wrap" ? ` · ${day}` : ""} ──\n\n${reply}\n\n`);
+  process.stdout.write(
+    `── ~${fmtInt(estIn)} in / ~${fmtInt(estOut)} out (estimated, excludes the agent's own tool calls) · ` +
+      `${((Date.now() - started) / 1000).toFixed(1)}s` +
+      (journalPath ? ` · journal ${journalPath}` : "") +
+      (opts.out ? ` · written to ${opts.out}` : "") +
+      ` ──\n`,
+  );
+}

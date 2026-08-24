@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to ~/.stonedog-ask/copilot.json. Every key is optional.",
+
+  "_copilotArgs": "Replaces the built-in base args wholesale. Set this if a flag name below turns out to be wrong on your Copilot version — the fix should be one line of JSON, not a patch to the script. Verify against `copilot --help` at install time.",
+  "copilotArgs": ["-s", "--no-ask-user"],
+
+  "_allowTools": "Tools the agent may use unattended. Reading mail to summarise it needs the relevant MCP tools named here. Leaving this empty is safe and useless; --allow-all-tools is useful and includes shell execution. Name what you need.",
+  "allowTools": [],
+
+  "_requireSources": "MCP server names that must be configured, or the run refuses. A brief missing a source looks exactly like a quiet day, which is the failure this prevents.",
+  "requireSources": [],
+
+  "_cwd": "Directory to run in. Copilot is agentic and takes its bearings from cwd. Defaults to the journal dir, which is deliberately boring.",
+  "cwd": null,
+
+  "_extraArgs": "Anything else passed through to copilot.",
+  "extraArgs": []
+}
