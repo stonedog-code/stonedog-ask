@@ -165,14 +165,142 @@ authenticates is not a token with Copilot access, which is exactly what
 > grant flag is not verified. Run `copilot --help` on the target machine and put
 > corrections in `copilotArgs` rather than patching the script.
 
-### Setting up the cron
+## Running it on a schedule
+
+`ask-copilot --cron` prints a ready-to-use schedule for this machine. Pass a
+platform to get another one:
 
 ```bash
-ask-copilot --check          # credentials, entitlement, sources
-ask-copilot --sources        # confirm mail/sharepoint are actually there
-ask-copilot --brief --dry-run  # read the assembled prompt before it runs alone
-ask-copilot --cron >> /tmp/lines && crontab -e
+ask-copilot --cron            # linux on Linux, launchd on macOS
+ask-copilot --cron linux      # crontab lines
+ask-copilot --cron systemd    # systemd user timer (better on a laptop)
+ask-copilot --cron macos      # launchd agents
 ```
 
-Cron gets almost no environment, which is precisely why the credential resolver
-reads the workstation secret directly: a cron job never ran `load-secrets`.
+### Before you schedule anything
+
+In this order. Each one fails differently, and finding out at 06:45 tomorrow is
+the expensive way.
+
+```bash
+ask-copilot --check             # credentials AND Copilot entitlement, real call
+ask-copilot --sources           # are mail/sharepoint actually configured?
+ask-copilot --brief --dry-run   # read the prompt before it runs unattended
+ask-copilot --brief             # one real run, watched, before it runs alone
+```
+
+### The gotcha that eats an evening: the interpreter
+
+**A scheduler's `PATH` is not your shell's `PATH`.** The shebang is
+`#!/usr/bin/env node`, and neither cron nor launchd sources a shell profile — so
+under nvm, where `node` lives in a versioned directory only your profile adds,
+the job dies with `env: node: No such file or directory` into a log nobody is
+watching. That is indistinguishable from a quiet day with nothing to report,
+which is the exact failure this whole tool is built to avoid.
+
+`--cron` therefore emits the **absolute** directory of the interpreter currently
+running, rather than hoping the scheduler finds one. Check what a scheduler would
+actually get before trusting it:
+
+```bash
+env -i PATH=/usr/bin:/bin sh -c 'command -v node && node -v'
+```
+
+If that prints nothing, the emitted `PATH` is doing essential work. If it prints
+a *different version* from `node -v` in your shell — which is the case on the
+machine this was written on — you now know your cron job and your terminal are
+not running the same Node, and you should pin it deliberately.
+
+### Linux — cron
+
+```bash
+ask-copilot --cron linux
+crontab -e     # paste
+crontab -l     # confirm
+```
+
+The emitted block sets `PATH` explicitly, sets `MAILTO=""` so cron does not mail
+you twice a day, and appends both streams to `~/.stonedog-ask/journal/cron.log`.
+
+### Linux — systemd user timer (preferred on a laptop)
+
+```bash
+ask-copilot --cron systemd     # writes two .service + two .timer files' contents
+# split them into ~/.config/systemd/user/ per the header comments, then:
+systemctl --user daemon-reload
+systemctl --user enable --now ask-copilot-brief.timer ask-copilot-wrap.timer
+systemctl --user list-timers 'ask-copilot-*'
+```
+
+Two reasons to prefer this to cron:
+
+- **`Persistent=true` runs a missed job once after boot.** Cron simply skips a
+  job whose time passed while the machine was off. On a laptop that is the
+  difference between a brief most mornings and a brief on the mornings you
+  happened to be booted before 06:45.
+- **`loginctl enable-linger $USER`** — run this once, or user timers stop the
+  moment you log out. It is the single most common reason a user timer "just
+  never runs".
+
+### macOS — launchd (preferred)
+
+macOS still has cron, but launchd is the supported mechanism and handles sleep
+properly.
+
+```bash
+ask-copilot --cron macos       # prints two plists and the commands
+# save them to ~/Library/LaunchAgents/com.stonedog.ask-copilot.{brief,wrap}.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stonedog.ask-copilot.brief.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stonedog.ask-copilot.wrap.plist
+launchctl list | grep ask-copilot
+```
+
+To change one, **bootout first** — `bootstrap` on an already-loaded label fails:
+
+```bash
+launchctl bootout gui/$(id -u)/com.stonedog.ask-copilot.brief
+```
+
+Four things specific to launchd, each of which fails silently:
+
+- **`StartCalendarInterval` takes an ARRAY of dicts, and launchd has no weekday
+  range.** Mon–Fri is five separate entries. A single dict with `Weekday` set to
+  a range is a common guess that quietly runs on Mondays only.
+- **`Weekday` is 0–6 with 0 = Sunday** (7 also works as Sunday). So 1–5 is
+  Mon–Fri.
+- **launchd runs a missed calendar job once the machine wakes**, where cron skips
+  it. This is the main reason to prefer it here.
+- **Full Disk Access.** If the job reads Mail, Calendar, or anything else macOS
+  protects, grant Full Disk Access to the binary named in `ProgramArguments`
+  (System Settings → Privacy & Security). Without it the job runs, exits 0, and
+  reads nothing.
+
+### macOS — cron, if you insist
+
+`crontab -e` still works and `ask-copilot --cron linux` emits usable lines. But
+`/usr/sbin/cron` needs **Full Disk Access** granted to it specifically, or jobs
+fail to read protected locations with no useful error, and Apple has deprecated
+the whole mechanism. Use launchd.
+
+### Confirming it actually ran
+
+A scheduler exiting 0 is not evidence that a brief was produced. Check the
+artifact, not the exit code:
+
+```bash
+ls -l ~/.stonedog-ask/journal/          # did today's file appear and grow?
+tail -40 ~/.stonedog-ask/journal/cron.log
+grep -c 'OPEN ITEMS' ~/.stonedog-ask/journal/$(date +%F).md
+```
+
+An empty or missing journal entry with a clean exit is the signature of the
+interpreter problem above, or of a source that was never reachable. `ask-copilot`
+exits non-zero on empty output for exactly this reason — but only the file proves
+the content is real.
+
+### Timezone
+
+Both schedulers use the machine's local time, and neither re-reads it mid-run.
+Cron applies `TZ` from the crontab if set; launchd uses the system timezone.
+The journal's day boundary is **local**, deliberately — a UTC boundary falls
+mid-afternoon in this timezone and would split one working day across two files.
