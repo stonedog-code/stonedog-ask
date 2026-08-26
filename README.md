@@ -337,6 +337,38 @@ Cron applies `TZ` from the crontab if set; launchd uses the system timezone.
 The journal's day boundary is **local**, deliberately — a UTC boundary falls
 mid-afternoon in this timezone and would split one working day across two files.
 
+## The gate
+
+```bash
+npm test                  # 76 assertions, two tiers, no network
+npm run test:self-check   # must FAIL — proves the suite can
+```
+
+Two tiers, and no third. This is a CLI with no browser surface, so an E2E tier
+here would be a second name for the integration one.
+
+| Tier | Answers | Runs against |
+|---|---|---|
+| `tests/unit` | precedence, env scrubbing, fingerprinting, journal carry-forward, the prompt/parser seam | pure functions; `aws` is a fake on PATH so "it must NOT shell out" is measurable |
+| `tests/integration` | both bins as real subprocesses — `--check`, the environment handed to the CLI, the ledger, `--cron`, `--sources`, `--dry-run` | fake `gemini`, `copilot`, `aws`, `gh` and `curl` first on PATH, in a sandboxed `HOME` |
+
+**Nothing here touches the network, AWS, or a real entitlement.**
+
+**Every test runs in a sandbox with its own `HOME`, and that is load-bearing.**
+The last source in the credential chain spawns `$SHELL -ic`, and an interactive
+shell sources the rc file of whoever's `HOME` it is handed. Run under yours, a
+test would read your real credentials, assert on a value only your machine has,
+and print it into scrollback — while a profile that resets `PATH` would let the
+subprocess escape the fake binaries entirely. Putting fakes first on `PATH` is
+not enough on its own; `tests/support/sandbox.mjs` supplies `HOME`, `PATH` and
+`SHELL` together, and one test asserts the sandbox actually holds.
+
+**`--self-check` plants six real defects** — a reversed resolver, an unstripped
+backend variable, a printed key, a carry-forward that returns nothing, a bare
+`node` in the crontab, a missing source that no longer stops the run — and
+requires each to be caught **by name**. It runs a control first: an unmodified
+copy must pass, or the plant results mean nothing.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

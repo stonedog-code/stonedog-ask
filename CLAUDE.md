@@ -16,6 +16,13 @@ Three things here are load-bearing, and each was learned by being burned —
   unless `~/.stonedog-ask/config.json` (or `WS_SECRET_ID`) names one. A baked-in
   default would name one machine's AWS account in everybody's checkout.
 
-**No test tier exists yet, and that is the gap to close before this is treated
-as finished** — NEH-1195. Until then, `node --check` on each bin and a real
-`--check` run are the only gate.
+**The gate is `npm test`** — 76 assertions over two tiers (unit + the bins as
+real subprocesses), no network, no AWS, no entitlement. `npm run test:self-check`
+plants six real defects and requires each to be caught by name; it runs a control
+first, because a harness that is itself broken reports every guard as broken.
+
+**Every test needs a sandboxed `HOME`, not just a faked `PATH`.** `fromLoginShell`
+spawns `$SHELL -ic`, which sources the rc file of whatever `HOME` it is given —
+so an unsandboxed test reads the developer's real credentials and an rc file that
+resets `PATH` escapes the fake binaries. `tests/support/sandbox.mjs` is the only
+correct way to run anything that can reach the credential chain.
