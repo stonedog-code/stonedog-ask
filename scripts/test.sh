@@ -121,7 +121,7 @@ if [ "${1:-}" = "--self-check" ]; then
 
   plant "cron emits a bare node instead of a path" bin/ask-copilot \
     's|const cronPath = `${nodeDir}:/usr/local/bin:/usr/bin:/bin`;|const cronPath = "/usr/local/bin:/usr/bin:/bin";|' \
-    'emits an ABSOLUTE interpreter directory' || fails=$((fails + 1))
+    'emits the directory of the interpreter that ran it' || fails=$((fails + 1))
 
   plant "a missing source no longer stops the run" bin/ask-copilot \
     's/^function requireSources(names) {/function requireSources(names) { return;/' \

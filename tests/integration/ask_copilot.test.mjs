@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { describe, test } from "node:test";
 
 import { fakeBin, recordingBin, run, sandbox } from "../support/sandbox.mjs";
@@ -25,10 +25,19 @@ function mcpConfig(box, servers) {
 // --- --cron ----------------------------------------------------------------
 
 describe("ask-copilot --cron", () => {
-  test("emits an ABSOLUTE interpreter directory, not a bare `node`", async () => {
+  test("emits the directory of the interpreter that ran it, first", async () => {
     /* THE failure this mode exists to prevent. A scheduler's PATH is not your
        shell's PATH: under nvm, `node` lives in a versioned directory that only
-       a profile adds, and neither cron nor launchd sources a profile. */
+       a profile adds, and neither cron nor launchd sources a profile.
+
+       The assertion is EQUALITY with `dirname(process.execPath)`, and that is
+       the correction rather than the original idea. This first read "is
+       absolute, and holds a `node`" — which the planted defect (a hardcoded
+       `/usr/local/bin:/usr/bin:/bin`) satisfies on any machine where
+       `/usr/local/bin/node` happens to exist. It does not here, so the plant
+       was caught locally; it does on a GitHub runner, so the same plant walked
+       straight through CI. An assertion whose verdict depends on what else is
+       installed is not an assertion about this code. */
     const box = sandbox();
     const r = run(box, "ask-copilot", ["--cron", "linux"]);
 
@@ -37,7 +46,11 @@ describe("ask-copilot --cron", () => {
     assert.ok(path, "no PATH line was emitted");
     const first = path[1].split(":")[0];
     assert.ok(isAbsolute(first), `PATH starts with a relative entry: ${first}`);
-    assert.equal(existsSync(join(first, "node")), true, "the emitted directory holds no `node`");
+    assert.equal(
+      first,
+      dirname(process.execPath),
+      "the emitted PATH does not lead with the interpreter that produced it",
+    );
   });
 
   test("silences cron's mail, so the job does not write to the user twice a day", async () => {
