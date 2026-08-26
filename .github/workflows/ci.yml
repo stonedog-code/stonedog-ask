@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # A matrix of two, deliberately: the FLOOR `package.json` declares, and the
+  # runtime this is actually developed on. Testing only the newest lets the
+  # declared floor rot untested; testing only the floor lets the tool break on
+  # the runtime its author uses. Both were run locally before this was written
+  # — 76/76 on each.
+  #
+  # NOTE FOR BRANCH PROTECTION: a matrix reports one context PER LEG, so the
+  # required contexts are `gate (20)` and `gate (24)`, not `gate`. Read them off
+  # a real PR before setting protection — a required context that never reports
+  # blocks every merge with nothing red to explain why.
+  gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No `npm ci`: this package has no dependencies, by design — it wraps
+      # vendor CLIs rather than calling their APIs. A lockfile install step here
+      # would be a step that always succeeds and proves nothing.
+      - name: Gate
+        run: bash scripts/test.sh
+
+      # The suite is only worth its runtime if it can fail. This plants six real
+      # defects in a copy of the tree and requires each to be caught BY NAME, so
+      # a guard that quietly stopped guarding fails CI rather than going on
+      # printing OK. It runs a control first: an unmodified copy must pass, or
+      # the plant results mean nothing.
+      #
+      # Once, not once per leg — it re-runs the whole suite per plant, and the
+      # question it answers has the same answer on both runtimes.
+      - name: Gate can fail (self-check)
+        if: matrix.node == 20
+        run: bash scripts/test.sh --self-check

@@ -15,5 +15,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/stonedog-code/stonedog-ask.git"
+  },
+  "scripts": {
+    "test": "bash scripts/test.sh",
+    "test:self-check": "bash scripts/test.sh --self-check"
   }
 }
