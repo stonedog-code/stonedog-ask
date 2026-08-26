@@ -35,6 +35,7 @@ import {
   fromWorkstationSecret,
   resolveCredential,
   strippedEnv,
+  wsConfigured,
   workstationSecret,
 } from "../lib/credentials.mjs";
 
@@ -195,27 +196,27 @@ function parseArgs(argv) {
  * `--api-key` remains the way to use a key deliberately; inheriting one by
  * accident is what this prevents.
  *
- * ## Where the key actually lives (changed 2026-08-22)
+ * ## Where the key actually lives
  *
- * It used to be a plaintext `export GOOGLE_API_KEY=` in `~/.bashrc`, which is
- * why the fallback below reads a login shell. That line is gone: the four
- * workstation credentials moved to **AWS Secrets Manager, `workstation/nehsa`**
- * (us-west-2, CMK `alias/workstation-secrets`), read by profile `hopperguard`,
- * and `~/.zsh-secrets.zsh` defines `load-secrets` to pull them into a shell on
- * demand. Nothing is fetched at shell start, deliberately — having
- * `GOOGLE_API_KEY` and `GOOGLE_CLOUD_PROJECT` in every shell is what made a
- * bare `gemini` unusable in the first place.
+ * The obvious answer is a plaintext `export GOOGLE_API_KEY=` in a shell
+ * profile, which is why the fallback below reads a login shell at all. It is
+ * also the answer this tool exists partly to stop needing: a key in every
+ * shell is a key in every process, and a mode-644 dotfile is a poor vault.
  *
- * **That is exactly why this tool broke.** Its only fallback asked
- * `bash -ic` for the variable, and after the migration no shell exports it
- * until someone runs `load-secrets`. So `ask-gemini --check` reported
- * *"No OAuth credentials and no API key"* on a machine whose key was sitting
- * in Secrets Manager, correct and reachable — a true statement about the
- * environment and a false one about the credential.
+ * So an optional secret store comes FIRST, ahead of the shell probe — see
+ * `WS_SECRET_ID` in ../lib/credentials.mjs. It is consulted directly, with no
+ * shell involved, which is the entire point: this tool has to work in a
+ * session that never sourced a profile, and that is every agent session and
+ * every cron job.
  *
- * So the secret is now a first-class source, ahead of the shell probe: this
- * tool reads it directly and needs no `load-secrets` in its caller. The shell
- * probe stays last, for a key someone exports by hand.
+ * **This is worth stating because getting it wrong is quiet.** An earlier
+ * version's only fallback asked `bash -ic` for the variable. On a machine
+ * whose key had moved out of the profile and into a secret store, `--check`
+ * reported *"No OAuth credentials and no API key"* — a true statement about
+ * the environment and a false one about the credential, and it reads as "the
+ * account is broken" rather than "the tool looked in one place".
+ *
+ * The shell probe stays last, for a key someone exported by hand.
  */
 function keyWorks(key) {
   if (!key) return false;
@@ -256,15 +257,18 @@ function geminiEnv() {
     // Ordered by cost and by trust — and shared with ask-copilot, so the two
     // tools cannot walk the sources differently and produce two different wrong
     // diagnoses for one broken machine. The current environment is free and is
-    // what `load-secrets` populates, so it wins when it works. The workstation
-    // secret is the canonical home and is consulted BEFORE any shell probe —
-    // that is the whole point: this tool must work in a session that never ran
-    // `load-secrets`, which is every agent and every cron job. The shell probe
-    // is last and now finds a key only if someone exported one by hand.
+    // free, so it wins when it works. A configured secret store is consulted
+    // BEFORE any shell probe — that is the whole point: this tool must work in
+    // a session that never sourced a profile, which is every agent and every
+    // cron job. The shell probe is last, for a key exported by hand.
     const { secret, source } = resolveCredential(
       [
         ["environment", () => [process.env.GEMINI_API_KEY, process.env.GOOGLE_API_KEY]],
-        [`${WS.id} (Secrets Manager)`, () => [fromWorkstationSecret("GOOGLE_API_KEY"), fromWorkstationSecret("GEMINI_API_KEY")]],
+        // Listed only when a secret is actually configured. An entry naming an
+        // empty secret id would be reported as a source that was consulted.
+        ...(wsConfigured()
+          ? [[`${WS.id} (Secrets Manager)`, () => [fromWorkstationSecret("GOOGLE_API_KEY"), fromWorkstationSecret("GEMINI_API_KEY")]]]
+          : []),
         ["login shell profile", () => [fromLoginShell("GEMINI_API_KEY"), fromLoginShell("GOOGLE_API_KEY")]],
       ],
       keyWorks,
@@ -321,8 +325,8 @@ function checkCredentials() {
   const key = geminiEnv().GEMINI_API_KEY;
   if (key) {
     // A sha prefix, not `key.slice(0, 6)`. `--check` output lands in scrollback,
-    // in CI logs and in agent transcripts; `rotate-secret` next door compares
-    // credentials by sha for exactly that reason, and printing the first six
+    // in CI logs and in agent transcripts. Comparing credentials by sha is the
+    // point, and printing the first six
     // characters of a live key for cosmetic recognisability is not worth it. A
     // fingerprint still answers the only question asked of it — is this the
     // same key as before.
@@ -352,9 +356,12 @@ function checkCredentials() {
       notes.push("API key accepted by generativelanguage.googleapis.com");
     }
   } else {
-    notes.push(
-      `No API key found in the environment, ${WS.id}, or a login shell — OAuth will be used`,
-    );
+    const searched = ["the environment", wsConfigured() ? WS.id : null, "a login shell"]
+      .filter(Boolean);
+    // "the environment, a login shell" is what a bare join produces once the
+    // middle entry drops out, and it reads as a truncated list.
+    const where = searched.slice(0, -1).join(", ") + " or " + searched.at(-1);
+    notes.push(`No API key found in ${where} — OAuth will be used`);
   }
 
   const creds = join(process.env.HOME ?? "", ".gemini", "oauth_creds.json");
@@ -383,19 +390,26 @@ function checkCredentials() {
     const inSecret = Boolean(
       workstationSecret().GOOGLE_API_KEY || workstationSecret().GEMINI_API_KEY,
     );
+    const awsCheck = wsConfigured()
+      ? `    A key can also live in AWS Secrets Manager as ${WS.id} — check that first:\n` +
+        `      aws secretsmanager get-secret-value` +
+        `${WS.profile ? ` --profile ${WS.profile}` : ""}` +
+        `${WS.region ? ` --region ${WS.region}` : ""} \\\n` +
+        `        --secret-id ${WS.id} --query SecretString --output text | jq -r 'keys[]'\n`
+      : `    A key can also be read from AWS Secrets Manager — set WS_SECRET_ID\n` +
+        `    (and WS_SECRET_PROFILE / WS_SECRET_REGION) to enable that source.\n`;
     problems.push(
       inSecret
         ? `No OAuth credentials, and the key in ${WS.id} is not being accepted by Google.\n` +
-            `    Fix: mint a new one at https://aistudio.google.com/apikey and store it with\n` +
-            `    \`rotate-secret GOOGLE_API_KEY\` (zsh), or run \`gemini\` once to log in with OAuth.`
+            `    Fix: mint a new one at https://aistudio.google.com/apikey and replace the\n` +
+            `    value in that secret, or run \`gemini\` once to log in with OAuth.`
         : `No OAuth credentials and no API key.\n` +
-            `    This machine keeps the key in AWS Secrets Manager as ${WS.id}\n` +
-            `    (${WS.region}, profile ${WS.profile}) — check that first:\n` +
-            `      aws secretsmanager get-secret-value --profile ${WS.profile} --region ${WS.region} \\\n` +
-            `        --secret-id ${WS.id} --query SecretString --output text | jq -r 'keys[]'\n` +
-            `    A missing GOOGLE_API_KEY there is set with \`rotate-secret GOOGLE_API_KEY\` (zsh).\n` +
-            `    Do NOT re-add it to a shell profile — that is what was migrated away from.\n` +
-            `    Otherwise run \`gemini\` once and complete the browser login.`,
+            `    Mint one at https://aistudio.google.com/apikey, or run \`gemini\` once and\n` +
+            `    complete the browser login.\n` +
+            awsCheck +
+            `    Prefer either of those to exporting the key from a shell profile: a key in\n` +
+            `    every shell is a key in every process, and a long-lived process never sees\n` +
+            `    a profile edit at all.`,
     );
   }
 
@@ -637,8 +651,8 @@ if (failed) {
   if (/API_KEY_INVALID|API key not valid/.test(reply + stderr)) {
     process.stderr.write(
       `\n  The API key (from ${resolvedKeySource ?? "an unknown source"}) is invalid, and it overrides OAuth.\n` +
-        "  Mint a new key at https://aistudio.google.com/apikey, then store it with\n" +
-        "  `rotate-secret GOOGLE_API_KEY` (zsh) — not in a shell profile.\n" +
+        "  Mint a new key at https://aistudio.google.com/apikey and put it wherever\n" +
+        "  this resolved it from — not in a shell profile.\n" +
         "  Or clear it and run `gemini` to log in with OAuth instead.\n",
     );
   }
