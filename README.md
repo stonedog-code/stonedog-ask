@@ -1,7 +1,7 @@
 # stonedog-ask
 
-Command-line front ends for the models this fleet uses as a *second opinion* —
-one command per vendor, sharing one credential resolver and one usage ledger.
+Command-line front ends for using a second model as a *second opinion* — one
+command per vendor, sharing one credential resolver and one usage ledger.
 
 | command | wraps | used for |
 |---|---|---|
@@ -14,11 +14,20 @@ key wherever the vendor allows it.
 
 ## Install
 
+Requires **Node 20 or newer**, and the vendor CLI for whichever command you
+want: `@google/gemini-cli` for `ask-gemini`, `@github/copilot` for
+`ask-copilot`.
+
 ```bash
 npm link             # puts ask-gemini and ask-copilot on PATH
 ask-gemini --check   # verifies credentials with a real call
 ask-copilot --check  # same, plus Copilot entitlement and MCP sources
 ```
+
+`npm link` rather than `npm install -g` because this is not published to npm —
+`package.json` is `private: true` so it cannot be pushed to a registry by
+accident. The **source** is Apache-2.0; not publishing is a distribution
+decision, not a licensing one.
 
 ## ask-gemini
 
@@ -64,14 +73,37 @@ get wrong, all of which were learned by being burned:
 actually accepts:
 
 1. the current environment (`GEMINI_API_KEY`, `GOOGLE_API_KEY`)
-2. **AWS Secrets Manager** — `workstation/nehsa`, overridable with
-   `WS_SECRET_ID` / `WS_SECRET_PROFILE` / `WS_SECRET_REGION`
+2. **AWS Secrets Manager**, if you have configured a secret — see below
 3. a login-shell probe, for a key someone exported by hand
 
-The secret is consulted *before* any shell probe, deliberately: the tool has to
-work in a session that never ran `load-secrets`, which is every agent session
-and every cron job. With no key at all the CLI falls back to OAuth, which is the
-correct path for an account whose entitlement is intact.
+With no key at all the CLI falls back to OAuth, which is the correct path for an
+account whose entitlement is intact.
+
+### The optional secret store
+
+A key in a shell profile is a key in every process, and a profile is invisible
+to cron and to any process that started before you edited it. So a secret store
+can be named, and it is consulted **before** any shell probe — that is the whole
+point: these tools have to work in a session that never sourced a profile, which
+is every agent session and every scheduled run.
+
+It is **off unless you name a secret.** Copy `config.example.json` to
+`~/.stonedog-ask/config.json`:
+
+```json
+{ "workstationSecret": { "id": "my-secret", "profile": "default", "region": "us-east-1" } }
+```
+
+The secret is an AWS Secrets Manager secret holding a JSON object of
+`NAME: value` pairs; `GOOGLE_API_KEY` and the Copilot token variables are read
+from it by name. `WS_SECRET_ID` / `WS_SECRET_PROFILE` / `WS_SECRET_REGION`
+override the file for one run.
+
+**A file rather than a shell export, for the same reason the store exists** —
+and it holds a secret *name*, never a secret value, which is why this repository
+can ship an example of one. No default is baked into the source: that would name
+one machine's AWS account in everybody's checkout, and make every other machine
+pay an `aws` timeout looking up something that was never theirs.
 
 **Never fix a credential failure by putting a key back in a dotfile.**
 
@@ -140,7 +172,7 @@ the single most likely way this job lies to you, so it fails loudly instead.
 Resolved in the same order as `ask-gemini`, through the same shared module:
 
 1. the environment — `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`
-2. the workstation secret (`WS_SECRET_ID`, default `workstation/nehsa`)
+2. the secret store, if one is configured (above)
 3. `gh auth token`
 4. a login-shell probe
 
@@ -304,3 +336,7 @@ Both schedulers use the machine's local time, and neither re-reads it mid-run.
 Cron applies `TZ` from the crontab if set; launchd uses the system timezone.
 The journal's day boundary is **local**, deliberately — a UTC boundary falls
 mid-afternoon in this timezone and would split one working day across two files.
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

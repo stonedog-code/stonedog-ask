@@ -1,0 +1,14 @@
+{
+  "_comment": [
+    "Copy to ~/.stonedog-ask/config.json. Holds a secret NAME, never a secret",
+    "value — so it is an ordinary file, and so this repository can ship an",
+    "example of it. Delete the file, or the block, to switch the source off.",
+    "WS_SECRET_ID / WS_SECRET_PROFILE / WS_SECRET_REGION override it per run."
+  ],
+  "workstationSecret": {
+    "id": "my-workstation-secret",
+    "profile": "default",
+    "region": "us-east-1",
+    "ttl": 43200
+  }
+}

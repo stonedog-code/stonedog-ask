@@ -34,6 +34,7 @@ import {
   fromWorkstationSecret,
   resolveCredential,
   strippedEnv,
+  wsConfigured,
   workstationSecret,
 } from "../lib/credentials.mjs";
 import { BRIEF_CRITERIA, WRAP_CRITERIA } from "../lib/prompts.mjs";
@@ -238,7 +239,12 @@ function copilotEnv() {
     resolved = resolveCredential(
       [
         ["environment", () => TOKEN_VARS.map((v) => process.env[v] ?? "")],
-        [`${WS.id} (Secrets Manager)`, () => TOKEN_VARS.map(fromWorkstationSecret)],
+        // Listed only when a secret is configured — see ../lib/credentials.mjs.
+        // An entry naming an empty secret id would be reported to the reader as
+        // a source that was consulted and came back empty.
+        ...(wsConfigured()
+          ? [[`${WS.id} (Secrets Manager)`, () => TOKEN_VARS.map(fromWorkstationSecret)]]
+          : []),
         ["gh auth token", () => [fromGhCli()]],
         ["login shell profile", () => TOKEN_VARS.map(fromLoginShell)],
       ],
@@ -337,10 +343,13 @@ function checkCredentials() {
     );
   } else {
     const inSecret = TOKEN_VARS.some((v) => workstationSecret()[v]);
+    const searched = ["the environment", wsConfigured() ? WS.id : null, "gh", "a login shell"]
+      .filter(Boolean)
+      .join(", ");
     notes.push(
       inSecret
         ? `A token exists in ${WS.id} but GitHub does not accept it — falling back to Copilot's own OAuth login`
-        : "No token in the environment, the workstation secret, gh, or a login shell — Copilot's own OAuth login will be used",
+        : `No token in ${searched} — Copilot's own OAuth login will be used`,
     );
   }
 
@@ -423,8 +432,8 @@ if (opts.mode === "cron") {
 #
 # PATH is explicit because cron gives a job almost nothing: no profile, no nvm,
 # typically just /usr/bin:/bin. MAILTO="" stops cron mailing you every run.
-# Credentials are resolved by ask-copilot itself, which is the whole reason the
-# workstation secret is a source — a cron job never ran \`load-secrets\`.
+# Credentials are resolved by ask-copilot itself, which is the whole reason a
+# secret store is a source at all — a cron job never sources a shell profile.
 
 SHELL=/bin/sh
 MAILTO=""
