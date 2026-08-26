@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manually runnable, and the reason is specific rather than general.
+  #
+  # A push that ADDS a workflow to the default branch does not run it — the
+  # workflow is registered from that push and only later pushes trigger it. So
+  # this repository sat with `CI state=active` and zero runs ever, which is the
+  # worst of the two states it could be in: an absent check reads as "no CI
+  # configured", while `active` reads as "gated". Without a manual trigger the
+  # only way to find out is to wait for someone's next PR.
+  workflow_dispatch:
 
 jobs:
   # A matrix of two, deliberately: the FLOOR `package.json` declares, and the
