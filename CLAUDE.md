@@ -17,5 +17,5 @@ Three things here are load-bearing, and each was learned by being burned —
   default would name one machine's AWS account in everybody's checkout.
 
 **No test tier exists yet, and that is the gap to close before this is treated
-as finished** — see the open issue. Until then, `node --check` on each bin and a
-real `--check` run are the only gate.
+as finished** — NEH-1195. Until then, `node --check` on each bin and a real
+`--check` run are the only gate.
