@@ -127,11 +127,25 @@ if [ "${1:-}" = "--self-check" ]; then
     's/^function requireSources(names) {/function requireSources(names) { return;/' \
     'stops the run instead of producing a brief about nothing' || fails=$((fails + 1))
 
+  # The 44-hour orphan (2026-08-27). Signalling the direct child only, with an
+  # ignorable signal, is both the original defect and the shape any "simplify
+  # this back to spawnSync" change would restore.
+  plant "timeout signals the child, not the group" lib/run-cli.mjs \
+    's/process.kill(-child.pid, "SIGKILL");/child.kill("SIGTERM");/' \
+    'the grandchild survived the timeout' || fails=$((fails + 1))
+
+  # The same bug one layer up: a process that escapes the group with setsid()
+  # keeps the inherited stdout, so `close` never fires. Without the grace
+  # teardown the call waits forever — which is what the timeout exists to stop.
+  plant "no grace teardown after the group kill" lib/run-cli.mjs \
+    's/      graceTimer = setTimeout(() => {/      graceTimer = setTimeout(() => { if (true) return;/' \
+    'an escapee cannot hang the call' || fails=$((fails + 1))
+
   if [ "$fails" -eq 0 ]; then
-    printf '\n  [self-check] 6 of 6 plants were caught by name. Correct.\n'
+    printf '\n  [self-check] 8 of 8 plants were caught by name. Correct.\n'
     exit 0
   fi
-  printf '\n  [self-check] %s of 6 plants went UNCAUGHT.\n' "$fails" >&2
+  printf '\n  [self-check] %s of 8 plants went UNCAUGHT.\n' "$fails" >&2
   exit 1
 fi
 
@@ -157,7 +171,7 @@ rc=${PIPESTATUS[0]}
 #
 # Raise MIN_TESTS when you add tests. It is a floor, not an equality: it exists
 # to catch assertions VANISHING, and a floor nobody updates still does that.
-MIN_TESTS=76
+MIN_TESTS=85
 
 # awk on FIELDS, not a regex with a character class. The runner prefixes each
 # summary line with a multibyte glyph (`ℹ tests 76`), and `[^0-9a-zA-Z]*` does

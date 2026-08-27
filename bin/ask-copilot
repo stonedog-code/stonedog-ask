@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { COPILOT_LEDGER, appendLedger, fmtInt } from "../lib/ai-usage-lib.mjs";
+import { runCli } from "../lib/run-cli.mjs";
 import {
   WS,
   fingerprint,
@@ -320,11 +321,11 @@ function toolArgs(opts, config) {
 
 // ── Check ─────────────────────────────────────────────────────────────────
 
-function checkCredentials() {
+async function checkCredentials() {
   const problems = [];
   const notes = [];
 
-  const bin = spawnSync("copilot", ["--version"], { encoding: "utf8", timeout: 60_000 });
+  const bin = await runCli("copilot", ["--version"], { timeoutMs: 60_000 });
   if (bin.error?.code === "ENOENT") {
     problems.push("The `copilot` CLI is not on PATH. Install it: npm i -g @github/copilot");
     return { ok: false, problems, notes };
@@ -373,10 +374,9 @@ function checkCredentials() {
    * genuinely valid, every call failing — and a check that stopped one line
    * above this would report "ready" and send you to debug the prompt.
    */
-  const probe = spawnSync("copilot", [...BASE_ARGS, "-p", "Reply with the single word: ok"], {
+  const probe = await runCli("copilot", [...BASE_ARGS, "-p", "Reply with the single word: ok"], {
     env,
-    encoding: "utf8",
-    timeout: 180_000,
+    timeoutMs: 180_000,
     cwd: existsSync(JOURNAL_DIR) ? JOURNAL_DIR : homedir(),
   });
   const out = `${probe.stdout ?? ""}${probe.stderr ?? ""}`;
@@ -563,7 +563,7 @@ if (opts.mode === "sources") {
 }
 
 if (opts.mode === "check") {
-  const c = checkCredentials();
+  const c = await checkCredentials();
   for (const n of c.notes) process.stdout.write(`  ${n}\n`);
   if (c.ok) {
     process.stdout.write("\nask-copilot: ready.\n");
@@ -624,7 +624,7 @@ if (opts.dryRun) {
   process.exit(0);
 }
 
-const cred = checkCredentials();
+const cred = await checkCredentials();
 if (!cred.ok) {
   process.stderr.write("ask-copilot: cannot call Copilot.\n");
   for (const p of cred.problems) process.stderr.write(`  ✗ ${p}\n`);
@@ -633,12 +633,14 @@ if (!cred.ok) {
 }
 
 const started = Date.now();
-const run = spawnSync("copilot", argv, {
+// `runCli`, not `spawnSync`: its timeout SIGKILLs the whole process group, so a
+// wedged CLI cannot leave a grandchild holding the machine's memory. See
+// ../lib/run-cli.mjs for the measurement that forced this.
+const run = await runCli("copilot", argv, {
   env: copilotEnv(),
   cwd,
-  encoding: "utf8",
   maxBuffer: 128 * 1024 * 1024,
-  timeout: opts.timeoutMs,
+  timeoutMs: opts.timeoutMs,
 });
 
 const reply = (run.stdout ?? "").trim();
@@ -647,7 +649,7 @@ const stderr = (run.stderr ?? "").trim();
 // Key on the exit code AND on the payload. Empty output is not success, and a
 // timeout produces exactly that — a cron job that treated silence as a quiet
 // day would write an empty brief and look like it worked.
-const timedOut = run.error?.code === "ETIMEDOUT" || run.signal === "SIGTERM";
+const timedOut = run.timedOut;
 const failed = run.status !== 0 || run.error || !reply;
 
 if (failed) {

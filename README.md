@@ -46,7 +46,7 @@ ask-gemini --check
 Ask one question, name the file, cap the answer length, and give every call a
 timeout.
 
-## Three things these wrappers exist to do
+## Four things these wrappers exist to do
 
 The vendor CLIs do the model call. These wrappers exist for the parts the CLIs
 get wrong, all of which were learned by being burned:
@@ -66,6 +66,26 @@ get wrong, all of which were learned by being burned:
    in `~/.claude/ai-usage/<vendor>.jsonl`. Gemini reports no usage metadata
    non-interactively, so those counts are a 4-chars-per-token estimate and every
    row carries `estimated: true`. Read them back with `get-gemini-usage`.
+4. **A timeout actually ends the call.** A hung `ask-gemini --repo` was found
+   holding **22 GiB for 44 hours** after its own 20-minute timeout had fired and
+   reported correctly. `spawnSync`'s `timeout` signals the direct child only —
+   and the Gemini CLI re-execs itself into a grandchild with a raised heap cap,
+   so the process owning the memory never gets the signal, is reparented to
+   `systemd --user`, and runs until someone goes looking. It also sends SIGTERM,
+   which a wedged CLI ignores, and it waits for the *pipes* to close rather than
+   the process to exit, so the orphan keeps the caller blocked and unable to
+   clean up. Every vendor-CLI call now goes through `lib/run-cli.mjs`, which
+   runs the child in its own process group and SIGKILLs the **group**. GNU
+   `timeout` is not a substitute: this was measured against uutils coreutils
+   0.8.0, whose `timeout` did not group-kill either.
+
+   What this guarantees is that **the caller always gets its answer back** —
+   not that nothing survives. A process that calls `setsid()` leaves the group
+   and outlives the signal; if it also holds the inherited stdout, `close`
+   never fires. So after the kill there is a short grace period, then the pipes
+   are torn down and the call resolves regardless. Without that, the wait
+   becomes unbounded again one layer up, which is the original bug in a
+   different hat.
 
 ## Credentials
 
@@ -340,7 +360,7 @@ mid-afternoon in this timezone and would split one working day across two files.
 ## The gate
 
 ```bash
-npm test                  # 76 assertions, two tiers, no network
+npm test                  # 85 assertions, two tiers, no network
 npm run test:self-check   # must FAIL — proves the suite can
 ```
 
@@ -349,7 +369,7 @@ here would be a second name for the integration one.
 
 | Tier | Answers | Runs against |
 |---|---|---|
-| `tests/unit` | precedence, env scrubbing, fingerprinting, journal carry-forward, the prompt/parser seam | pure functions; `aws` is a fake on PATH so "it must NOT shell out" is measurable |
+| `tests/unit` | precedence, env scrubbing, fingerprinting, journal carry-forward, the prompt/parser seam, the process-group kill | pure functions; `aws` is a fake on PATH so "it must NOT shell out" is measurable |
 | `tests/integration` | both bins as real subprocesses — `--check`, the environment handed to the CLI, the ledger, `--cron`, `--sources`, `--dry-run` | fake `gemini`, `copilot`, `aws`, `gh` and `curl` first on PATH, in a sandboxed `HOME` |
 
 **Nothing here touches the network, AWS, or a real entitlement.**

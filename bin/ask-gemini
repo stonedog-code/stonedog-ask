@@ -28,6 +28,7 @@ import { basename, resolve } from "node:path";
 import { join } from "node:path";
 
 import { GEMINI_LEDGER, appendLedger, fmtInt } from "../lib/ai-usage-lib.mjs";
+import { runCli } from "../lib/run-cli.mjs";
 import {
   WS,
   fingerprint,
@@ -50,6 +51,15 @@ const DEFAULT_MODEL = "gemini-3.1-pro-preview";
  */
 const MAX_FILE_BYTES = 2_000_000;
 const MAX_REPO_BYTES = 40_000_000;
+
+/**
+ * A hang produces NO partial output, so this is a cap on wasted wall-clock, not
+ * a limit on how good an answer can get. Twenty minutes is already generous:
+ * every short, single-question prompt measured has answered in 15-20 seconds,
+ * and the calls that pass this bound are the ones that were never going to
+ * return. The lever on a slow call is prompt scope, not a longer timeout.
+ */
+const GEMINI_TIMEOUT_MS = 20 * 60 * 1000;
 
 // ── Review criteria ───────────────────────────────────────────────────────
 //
@@ -299,7 +309,7 @@ function geminiEnv() {
  * environment TAKES PRECEDENCE over a perfectly good OAuth login — so the
  * symptom is "my credentials are broken" when the fix is to remove a variable.
  */
-function checkCredentials() {
+async function checkCredentials() {
   const problems = [];
   const notes = [];
 
@@ -309,7 +319,7 @@ function checkCredentials() {
   // banner of system hints — which lands on stdout and becomes the "path" this
   // reported. Running the binary directly asks the question with nothing else
   // in the way, and its failure to exist is an ENOENT rather than a parse.
-  const bin = spawnSync("gemini", ["--version"], { encoding: "utf8", timeout: 30_000 });
+  const bin = await runCli("gemini", ["--version"], { timeoutMs: 30_000 });
   if (bin.error?.code === "ENOENT") {
     problems.push("The `gemini` CLI is not on PATH. Install it: npm i -g @google/gemini-cli");
     return { ok: false, problems, notes };
@@ -428,10 +438,10 @@ function checkCredentials() {
    * One token, cheapest model. The cost of the probe is far below the cost of
    * discovering this in the middle of a review.
    */
-  const probe = spawnSync(
+  const probe = await runCli(
     "gemini",
     ["--skip-trust", "-m", "gemini-2.5-flash", "-p", "Reply with the single word: ok"],
-    { env: geminiEnv(), encoding: "utf8", timeout: 120_000 },
+    { env: geminiEnv(), timeoutMs: 120_000 },
   );
   const out = `${probe.stdout ?? ""}${probe.stderr ?? ""}`;
 
@@ -533,7 +543,7 @@ function repoContext(dir) {
 const opts = parseArgs(process.argv.slice(2));
 
 if (opts.mode === "check") {
-  const c = checkCredentials();
+  const c = await checkCredentials();
   for (const n of c.notes) process.stdout.write(`  ${n}\n`);
   if (c.ok) {
     process.stdout.write("\nask-gemini: ready.\n");
@@ -608,7 +618,7 @@ if (opts.dryRun) {
   process.exit(0);
 }
 
-const cred = checkCredentials();
+const cred = await checkCredentials();
 if (!cred.ok) {
   process.stderr.write("ask-gemini: cannot call Gemini.\n");
   for (const p of cred.problems) process.stderr.write(`  ✗ ${p}\n`);
@@ -623,12 +633,15 @@ if (!cred.ok) {
 // install. stdin has no such limit. -p carries the instruction again so it is
 // the last thing the model reads rather than the first.
 const started = Date.now();
-const run = spawnSync("gemini", ["--skip-trust", "-m", opts.model, "-p", instruction], {
+
+// `runCli`, not `spawnSync`: a timeout here must kill the process GROUP with
+// SIGKILL, or the CLI's raised-heap grandchild outlives the timeout and sits on
+// the machine's memory indefinitely. See ../lib/run-cli.mjs for the measurement.
+const run = await runCli("gemini", ["--skip-trust", "-m", opts.model, "-p", instruction], {
   input: prompt,
   env: geminiEnv(),
-  encoding: "utf8",
   maxBuffer: 128 * 1024 * 1024,
-  timeout: 20 * 60 * 1000,
+  timeoutMs: GEMINI_TIMEOUT_MS,
 });
 
 const reply = (run.stdout ?? "").trim();
@@ -645,7 +658,15 @@ const failed =
 
 if (failed) {
   process.stderr.write("ask-gemini: the call failed.\n");
-  if (run.error) process.stderr.write(`  ${run.error.message}\n`);
+  if (run.timedOut) {
+    process.stderr.write(
+      `  Timed out after ${GEMINI_TIMEOUT_MS / 1000}s and the process tree was killed.\n` +
+        "  A hung call produces no partial output, so waiting longer buys nothing —\n" +
+        "  ask one question, name the file, and cap the answer.\n",
+    );
+  } else if (run.error) {
+    process.stderr.write(`  ${run.error.message}\n`);
+  }
   if (reply) process.stderr.write(`  ${reply.slice(0, 800)}\n`);
   if (stderr) process.stderr.write(`  ${stderr.slice(0, 800)}\n`);
   if (/API_KEY_INVALID|API key not valid/.test(reply + stderr)) {
