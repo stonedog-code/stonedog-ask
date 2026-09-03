@@ -15,10 +15,17 @@ Three things here are load-bearing, and each was learned by being burned —
 - **Nothing about this machine is in the repository.** The secret store is off
   unless `~/.stonedog-ask/config.json` (or `WS_SECRET_ID`) names one. A baked-in
   default would name one machine's AWS account in everybody's checkout.
+- **A timeout must end the process GROUP, not the direct child.** A hung call
+  held 22 GiB for 44 hours after its timeout fired and reported correctly:
+  `spawnSync` signals only the child, the vendor CLI re-execs into a
+  raised-heap grandchild, and that grandchild is orphaned onto `systemd --user`.
+  Every vendor-CLI call goes through `lib/run-cli.mjs`. Do not "simplify" it
+  back to `spawnSync` — the seventh self-check plant exists to catch exactly
+  that.
 
-**The gate is `npm test`** — 76 assertions over two tiers (unit + the bins as
+**The gate is `npm test`** — 85 assertions over two tiers (unit + the bins as
 real subprocesses), no network, no AWS, no entitlement. `npm run test:self-check`
-plants six real defects and requires each to be caught by name; it runs a control
+plants eight real defects and requires each to be caught by name; it runs a control
 first, because a harness that is itself broken reports every guard as broken.
 
 **Every test needs a sandboxed `HOME`, not just a faked `PATH`.** `fromLoginShell`
