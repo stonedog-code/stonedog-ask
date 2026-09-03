@@ -21,7 +21,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +32,8 @@ import { runCli } from "../../lib/run-cli.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "ask-runcli-"));
 const strays = [];
+/** Process GROUPS to sweep — a wrapper spawned `detached` leads its own. */
+const strayGroups = [];
 
 /**
  * Long enough that no check can outlive it (the longest waits ~8s), short
@@ -129,6 +131,11 @@ after(() => {
   for (const pid of strays) {
     try { process.kill(pid, "SIGKILL"); } catch { /* already gone: the point */ }
   }
+  /* Never `pkill -f` an equivalent here: a pattern kill matches the process
+     doing the matching. Explicit pids and explicit groups only. */
+  for (const pgid of strayGroups) {
+    try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone: the point */ }
+  }
 });
 
 describe("runCli", () => {
@@ -183,6 +190,79 @@ describe("runCli", () => {
     ]);
     assert.equal(settled, "settled", `never resolved (${Date.now() - started}ms): an escapee is holding the pipe`);
     await grandchildPid(pidFile); // record it so cleanup gets it
+  });
+
+  test("an interrupt takes the vendor tree down, not just the wrapper", async () => {
+    /*
+     * THE SAME ORPHAN, THROUGH THE OTHER DOOR.
+     *
+     * `detached: true` is what makes the group kill above possible, and it is
+     * also what removes the vendor tree from the terminal's foreground process
+     * group. A Ctrl-C then reaches this wrapper only: the wrapper dies, and the
+     * grandchild holding the memory is reparented to `systemd --user` — exactly
+     * the 44-hour leak, arrived at by the path people actually take. Nobody
+     * waits out a 20-minute timeout; they interrupt at minute two.
+     *
+     * Measured on the unfixed branch, same stub, SIGINT to the wrapper's group:
+     *   wrapper pgid 927007, grandchild pgid 927016 -> grandchild SURVIVED
+     * and with the handler:
+     *   wrapper pgid 928723, grandchild pgid 928736 -> grandchild died
+     *
+     * Note the groups stay DISTINCT in both. The fix is not to undo `detached`
+     * — that would restore the timeout bug — it is to forward the signal.
+     *
+     * A real wrapper process is required: the handler is installed on
+     * `process`, so a same-process test would signal the test runner itself.
+     */
+    const { launcher, pidFile } = stubTree("sigint");
+    const wrapper = join(dir, "sigint-wrapper.mjs");
+    const runCliUrl = new URL("../../lib/run-cli.mjs", import.meta.url).href;
+    writeFileSync(
+      wrapper,
+      `import { runCli } from ${JSON.stringify(runCliUrl)};\n` +
+        `await runCli("bash", ["-c", ${JSON.stringify(launcher)}], { timeoutMs: 120000 });\n`,
+    );
+
+    /* `detached` so the wrapper LEADS its own group, which is what a terminal
+       gives a foreground job — and what makes `kill(-pid)` below the same
+       signal Ctrl-C sends. `stdio: "ignore"`: an inherited pipe held by a
+       leaked stub is what once hung the gate for minutes. */
+    const child = spawn(process.execPath, [wrapper], { detached: true, stdio: "ignore" });
+    strayGroups.push(child.pid);
+    const pid = await grandchildPid(pidFile);
+
+    process.kill(-child.pid, "SIGINT");
+    for (let i = 0; i < 60 && alive(pid); i++) await sleep(100);
+    assert.equal(alive(pid), false, "the grandchild survived the interrupt — Ctrl-C leaks the orphan");
+  });
+
+  test("a multibyte character straddling a chunk boundary is not corrupted", async () => {
+    /*
+     * A pipe breaks at arbitrary byte offsets, so decoding each chunk on its
+     * own splits any multibyte character in two and silently yields U+FFFD.
+     * `spawnSync` decoded one whole buffer and could not hit a boundary, so
+     * this arrived with the move to `spawn`.
+     *
+     * The em-dash sits at byte 65535, the first boundary a 64KiB read makes.
+     * Measured: per-chunk toString gave replacements=3, hasEmDash=false;
+     * `setEncoding("utf8")` gives 0 and true. This codebase's own prose is
+     * dense with em-dashes and curly quotes, and a long review is exactly the
+     * >64KiB shape — silent corruption of the answer, not a loud failure.
+     */
+    const filler = 65535;
+    const tail = 64;
+    const r = await runCli(
+      process.execPath,
+      ["-e", `process.stdout.write("a".repeat(${filler}) + "\\u2014" + "b".repeat(${tail}))`],
+      { timeoutMs: 30_000 },
+    );
+    const replacements = [...r.stdout].filter((c) => c === "�").length;
+    assert.equal(replacements, 0, `a multibyte character was corrupted at a chunk boundary: ${replacements} U+FFFD`);
+    assert.ok(r.stdout.includes("—"), "the em-dash was lost at the chunk boundary");
+    /* Length, not just the absence of U+FFFD: a decoder that dropped the
+       partial bytes rather than replacing them would satisfy the count. */
+    assert.equal(r.stdout.length, filler + 1 + tail);
+    assert.equal(r.status, 0);
   });
 
   test("a healthy call still returns its output and status", async () => {

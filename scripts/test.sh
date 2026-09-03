@@ -141,11 +141,25 @@ if [ "${1:-}" = "--self-check" ]; then
     's/      graceTimer = setTimeout(() => {/      graceTimer = setTimeout(() => { if (true) return;/' \
     'an escapee cannot hang the call' || fails=$((fails + 1))
 
+  # The same orphan through the interrupt door. `detached` takes the vendor
+  # tree out of the terminal's foreground group, so without the forwarding
+  # handler a Ctrl-C kills the wrapper and leaks the grandchild — which is the
+  # path people actually use on a slow call.
+  plant "an interrupt no longer reaches the group" lib/run-cli.mjs \
+    's/    for (const s of SIGNALS) process.once(s, onSignal);/ /' \
+    'the grandchild survived the interrupt' || fails=$((fails + 1))
+
+  # Per-chunk decoding of a pipe's Buffers. Silent corruption of the answer,
+  # which is worse than a loud failure and invisible below ~64KiB.
+  plant "multibyte decoded per chunk, not per stream" lib/run-cli.mjs \
+    's/    child.stdout.setEncoding("utf8");/ /' \
+    'a multibyte character was corrupted at a chunk boundary' || fails=$((fails + 1))
+
   if [ "$fails" -eq 0 ]; then
-    printf '\n  [self-check] 8 of 8 plants were caught by name. Correct.\n'
+    printf '\n  [self-check] 10 of 10 plants were caught by name. Correct.\n'
     exit 0
   fi
-  printf '\n  [self-check] %s of 8 plants went UNCAUGHT.\n' "$fails" >&2
+  printf '\n  [self-check] %s of 10 plants went UNCAUGHT.\n' "$fails" >&2
   exit 1
 fi
 
@@ -171,7 +185,7 @@ rc=${PIPESTATUS[0]}
 #
 # Raise MIN_TESTS when you add tests. It is a floor, not an equality: it exists
 # to catch assertions VANISHING, and a floor nobody updates still does that.
-MIN_TESTS=85
+MIN_TESTS=87
 
 # awk on FIELDS, not a regex with a character class. The runner prefixes each
 # summary line with a multibyte glyph (`ℹ tests 76`), and `[^0-9a-zA-Z]*` does
