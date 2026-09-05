@@ -308,4 +308,42 @@ describe("runCli", () => {
     assert.equal(r.truncated, true);
     assert.equal(r.status, 0);
   });
+
+  /*
+   * NEH-1409. Truncation is tracked PER STREAM, and the cap is reported back.
+   *
+   * A caller has to append "[truncated at N characters]" to the answer, so it
+   * needs two facts a single boolean cannot carry: whether it was the ANSWER
+   * that was cut (not a chatty stderr), and what N was. Without the split, a
+   * vendor that logs a lot would make a complete answer claim to be partial.
+   */
+  test("reports WHICH stream was truncated, and the cap it was truncated at", async () => {
+    const out = await runCli("bash", ["-c", "printf 'abcdefghij'"], { timeoutMs: 30_000, maxBuffer: 4 });
+    assert.equal(out.truncatedStdout, true, "stdout overflowed and must say so");
+    assert.equal(out.truncatedStderr, false, "stderr wrote nothing; it must not be flagged");
+    assert.equal(out.maxBuffer, 4, "the cap is reported so a notice can name it");
+
+    const err = await runCli("bash", ["-c", "printf 'abcdefghij' >&2"], { timeoutMs: 30_000, maxBuffer: 4 });
+    assert.equal(err.truncatedStderr, true);
+    assert.equal(
+      err.truncatedStdout,
+      false,
+      "a chatty stderr must NOT mark the answer partial — that is the whole point of the split",
+    );
+    assert.equal(err.truncated, true, "the either-stream flag stays true for existing callers");
+  });
+
+  test("a call that fits under maxBuffer is flagged on neither stream", async () => {
+    // The control. Without it, a `truncatedStdout` stuck true would pass the
+    // test above and put a truncation notice on every complete answer.
+    const r = await runCli("bash", ["-c", "printf 'abc'; printf 'xyz' >&2"], {
+      timeoutMs: 30_000,
+      maxBuffer: 1024,
+    });
+    assert.equal(r.stdout, "abc");
+    assert.equal(r.stderr, "xyz");
+    assert.equal(r.truncated, false);
+    assert.equal(r.truncatedStdout, false);
+    assert.equal(r.truncatedStderr, false);
+  });
 });

@@ -185,7 +185,7 @@ rc=${PIPESTATUS[0]}
 #
 # Raise MIN_TESTS when you add tests. It is a floor, not an equality: it exists
 # to catch assertions VANISHING, and a floor nobody updates still does that.
-MIN_TESTS=87
+MIN_TESTS=89
 
 # awk on FIELDS, not a regex with a character class. The runner prefixes each
 # summary line with a multibyte glyph (`ℹ tests 76`), and `[^0-9a-zA-Z]*` does
