@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "project": "stonedog-ask",
+  "tiers": {
+    "unit": {
+      "include": ["tests/unit/**/*.test.mjs"]
+    },
+    "integration": {
+      "include": ["tests/integration/**/*.test.mjs"]
+    }
+  }
+}
