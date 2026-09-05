@@ -698,12 +698,43 @@ if ((opts.mode === "brief" || opts.mode === "wrap") && !opts.noJournal) {
   journalPath = writeEntry(day, opts.mode, reply);
 }
 
-if (opts.out) writeFileSync(opts.out, reply + "\n", "utf8");
+/*
+ * A TRUNCATED ANSWER MUST SAY SO, IN THE ANSWER (NEH-1409).
+ *
+ * `runCli` caps what it retains rather than killing the child, deliberately:
+ * killing on overflow turns a merely chatty answer into a failure with no
+ * output at all, which is the worse of the two. But the other half never
+ * landed — under `spawnSync` an overflow surfaced as `ENOBUFS` and tripped the
+ * `failed` path, so the user was told. Truncate-and-continue removed the
+ * failure without adding a notice, and a loud-but-useless outcome became a
+ * quiet-and-plausible one.
+ *
+ * The marker goes in `reply` rather than only on stderr because these bins are
+ * used non-interactively and piped into files: `ask-gemini ... > out.txt`
+ * discards stderr entirely, so a warning alone leaves the saved file claiming
+ * to be a whole answer. Appending it here puts it in all three sinks — `--out`,
+ * `--raw` and the formatted body — from one place. The stderr line is kept as
+ * well, for the interactive case where the marker scrolls past.
+ *
+ * `truncatedStdout`, not `truncated`: a chatty stderr must not make a complete
+ * answer claim to be partial.
+ */
+const truncationNotice = run.truncatedStdout
+  ? `\n\n[truncated at ${fmtInt(run.maxBuffer)} characters — the vendor's answer was longer than this call retains]`
+  : "";
+if (run.truncatedStdout) {
+  process.stderr.write(
+    `ask-copilot: WARNING the answer was truncated at ${fmtInt(run.maxBuffer)} characters.\n` +
+      "  The text below is partial. Narrow the question or raise maxBuffer.\n",
+  );
+}
+
+if (opts.out) writeFileSync(opts.out, reply + truncationNotice + "\n", "utf8");
 
 if (opts.raw) {
-  process.stdout.write(reply + "\n");
+  process.stdout.write(reply + truncationNotice + "\n");
 } else {
-  process.stdout.write(`── copilot · ${opts.mode ?? "ask"}${opts.mode === "brief" || opts.mode === "wrap" ? ` · ${day}` : ""} ──\n\n${reply}\n\n`);
+  process.stdout.write(`── copilot · ${opts.mode ?? "ask"}${opts.mode === "brief" || opts.mode === "wrap" ? ` · ${day}` : ""} ──\n\n${reply}${truncationNotice}\n\n`);
   process.stdout.write(
     `── ~${fmtInt(estIn)} in / ~${fmtInt(estOut)} out (estimated, excludes the agent's own tool calls) · ` +
       `${((Date.now() - started) / 1000).toFixed(1)}s` +
